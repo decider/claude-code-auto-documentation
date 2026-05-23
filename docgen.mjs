@@ -672,6 +672,50 @@ export function assembleContext(root, dir, files, opts = {}) {
 
 // ─── analysis core ────────────────────────────────────────────────────────
 
+/** Inspect the user's local clone for our pre-push hook. Returns
+ *  `{installed, reason}` — `reason` explains the specific gap so the
+ *  status output can be actionable rather than just "not installed."
+ *  Recognises 4 install layouts: vanilla `.git/hooks/pre-push`, chained
+ *  `.git/hooks/pre-push-local`, plus both at `core.hooksPath` if set. */
+function checkPreHookInstalled(root) {
+  const MARKER = 'DOCGEN_PRE_PUSH_HOOK_v1';
+  const gitDirRaw = (() => {
+    try { return execFileSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8' }).trim(); }
+    catch { return null; }
+  })();
+  if (!gitDirRaw) return { installed: false, reason: 'not in a git repo' };
+  const gitDir = resolve(root, gitDirRaw);
+  const hooksPath = (() => {
+    try {
+      const p = execFileSync('git', ['config', 'core.hooksPath'], { cwd: root, encoding: 'utf8' }).trim();
+      return p ? resolve(root, p) : null;
+    } catch { return null; }
+  })();
+  const candidates = [
+    join(gitDir, 'hooks', 'pre-push'),
+    join(gitDir, 'hooks', 'pre-push-local'),
+    ...(hooksPath ? [join(hooksPath, 'pre-push'), join(hooksPath, 'pre-push-local')] : []),
+  ];
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    try {
+      if (readFileSync(path, 'utf8').includes(MARKER)) {
+        return { installed: true, reason: `via ${relative(root, path)}` };
+      }
+    } catch { /* skip */ }
+  }
+  return { installed: false, reason: 'no pre-push file carries the docgen marker (DOCGEN_PRE_PUSH_HOOK_v1)' };
+}
+
+/** True when the failure looks like "the file/dir we're operating on
+ *  vanished" — covers the short-lived-worktree cleanup race that
+ *  hits when another tool spawns + tears down a temp clone faster
+ *  than the detached docgen background process can finish. */
+function isVanishedPathError(err) {
+  if (!err || typeof err !== 'object') return false;
+  return err.code === 'ENOENT' || err.code === 'ENOTDIR' || err.code === 'EACCES';
+}
+
 export async function analyzeOne(root, opts = {}) {
   const {
     runner = defaultRunner,
@@ -704,6 +748,19 @@ export async function analyzeOne(root, opts = {}) {
     }
   }
   if (!target) return { picked: null };
+
+  // Defensive: the target dir may have vanished between when the walk
+  // picked it and when we run. Happens when another tool spawns a
+  // short-lived worktree, kicks the pre-push hook, then deletes the
+  // worktree before our detached background docgen finishes. Skip
+  // cleanly so the next batch step keeps making progress.
+  if (!existsSync(target)) {
+    return {
+      picked: relative(root, target) || '.',
+      skipped: 'vanished',
+      message: `target directory no longer exists (worktree cleanup race?); skipping`,
+    };
+  }
 
   const files = selectFiles(target);
   const childReadmes = findChildReadmesInState(root, target, state);
@@ -772,7 +829,25 @@ export async function analyzeOne(root, opts = {}) {
   const bodyWithoutVersion = cleaned.replace(VERSION_RE, '').replace(/^\s+/, '');
   const finalContent = `${MARKER}\n${normalisedVersionLine}\n\n${bodyWithoutVersion}\n`;
 
-  writeFileSync(readmePath, finalContent);
+  // Ensure parent exists (mkdirp) and wrap write — if the worktree was
+  // partially cleaned mid-flight the leaf dir may be gone even though
+  // the existsSync(target) check above passed. mkdirSync recursive is
+  // a no-op when the dir already exists. ENOENT/ENOTDIR/EACCES at the
+  // write site means the path is gone; skip cleanly instead of
+  // crashing the whole batch.
+  try {
+    mkdirSync(dirname(readmePath), { recursive: true });
+    writeFileSync(readmePath, finalContent);
+  } catch (err) {
+    if (isVanishedPathError(err)) {
+      return {
+        picked: rel,
+        skipped: 'vanished',
+        message: `path no longer writable (${err.code}); worktree likely cleaned mid-run`,
+      };
+    }
+    throw err;
+  }
 
   // Persist via the merging save so concurrent analyzeOne calls (with
   // `--parallel N`) don't clobber each other's entries. saveStateMerging
@@ -998,6 +1073,17 @@ async function main() {
       console.log('  protected (sample):');
       for (const d of examples) console.log(`    - ${d.dir}/README.md`);
       console.log('  (use --force --dir <path> to deliberately convert a hand-written README)');
+    }
+    // Hook-install check. Auto-refresh only fires when the pre-push
+    // hook is installed on this clone. Git hooks aren't versioned,
+    // so every fresh clone starts without one — surface it loudly so
+    // operators notice instead of silently shipping drift.
+    const hookState = checkPreHookInstalled(root);
+    if (!hookState.installed) {
+      console.log('');
+      console.log('  ⚠ pre-push hook NOT installed on this clone — auto-refresh will not fire');
+      console.log(`    reason: ${hookState.reason}`);
+      console.log('    install: ./install-push-hook.sh');
     }
     return;
   }
