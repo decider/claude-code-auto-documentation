@@ -1,3 +1,7 @@
 node_modules/
 *.log
-/.docgen/
+# `.docgen/state.json` IS tracked — content-hash staleness makes it
+# durable across clones (vs mtimes which shift on every checkout).
+# Ignore other artifacts that might appear under .docgen/ in the future.
+/.docgen/*
+!/.docgen/state.json
