@@ -1,0 +1,46 @@
+{
+  "name": "claude-docgen",
+  "version": "0.1.0",
+  "description": "Generate per-directory READMEs for Claude agents — an agent-optimized codebase index that auto-refreshes on push.",
+  "license": "MIT",
+  "author": "Daniel <decider@users.noreply.github.com>",
+  "homepage": "https://github.com/decider/claude-docgen",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/decider/claude-docgen.git"
+  },
+  "bugs": {
+    "url": "https://github.com/decider/claude-docgen/issues"
+  },
+  "bin": {
+    "docgen": "./docgen"
+  },
+  "scripts": {
+    "test": "node --test docgen.test.mjs inject-readme-context.test.mjs hooks/pre-push.test.mjs",
+    "test:unit": "node --test docgen.test.mjs inject-readme-context.test.mjs",
+    "test:e2e": "node --test hooks/pre-push.test.mjs"
+  },
+  "files": [
+    "docgen",
+    "docgen.mjs",
+    "prompt.md",
+    "inject-readme-context.mjs",
+    "hooks/pre-push",
+    "install-push-hook.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "documentation",
+    "readme",
+    "docgen",
+    "ai-agent",
+    "git-hook",
+    "pre-push"
+  ]
+}

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# docgen — thin bash wrapper around docgen.mjs.
+#
+# Lets you call `tools/docgen/docgen ...` instead of remembering to
+# `node tools/docgen/docgen.mjs ...`. Resolves the script's own
+# directory so the wrapper works whether invoked from the repo root,
+# a sub-directory, or via an absolute path.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "$HERE/docgen.mjs" "$@"
