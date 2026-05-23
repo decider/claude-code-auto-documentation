@@ -68,9 +68,12 @@ tools/claude-code-auto-documentation/docgen --until-done --parallel 4
 tools/claude-code-auto-documentation/docgen status
 ```
 
-A typical repo bootstrap is ~$0.10–0.20 per directory (~25s per dir at
-parallel=1, ~10s at parallel=4) against the Claude API. Free if you
-run on a Claude Pro / Max subscription.
+docgen shells out to the `claude` CLI (`claude -p`), so it uses
+whatever auth your local Claude Code setup already has — **no Anthropic
+API key required**, no separate billing setup. Typical bootstrap takes
+~25s/dir at parallel=1 or ~10s/dir at parallel=4. On a Claude Pro / Max
+subscription it's covered by the flat monthly fee; on metered API
+billing through the CLI it's ~$0.10–0.20 per directory.
 
 ### Day-to-day
 
