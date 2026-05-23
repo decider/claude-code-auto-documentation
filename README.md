@@ -1,10 +1,10 @@
-# claude-docgen
+# claude-code-auto-documentation
 
 > Per-directory READMEs for Claude agents — an agent-optimized codebase
 > index that auto-refreshes on push.
 
 When a Claude Code agent navigates an unfamiliar repo, it grep-and-reads
-its way through dozens of files just to orient. `claude-docgen` writes
+its way through dozens of files just to orient. `claude-code-auto-documentation` writes
 one `README.md` per directory describing what's there, where it
 collaborates, and what gotchas to watch for — content shaped for the
 LLM, not for human onboarding docs. Two companion git hooks make the
@@ -37,11 +37,11 @@ up to parent READMEs when there's a material (minor+) change.
 ### One-time setup in a repo
 
 ```bash
-# 1. Vendor claude-docgen into your repo (or `npm install -g claude-docgen`)
-git clone https://github.com/decider/claude-docgen.git tools/claude-docgen
+# 1. Vendor claude-code-auto-documentation into your repo (or `npm install -g claude-code-auto-documentation`)
+git clone https://github.com/decider/claude-code-auto-documentation.git tools/claude-code-auto-documentation
 
 # 2. (Optional) Install the auto-refresh-on-push hook
-tools/claude-docgen/install-push-hook.sh install
+tools/claude-code-auto-documentation/install-push-hook.sh install
 
 # 3. (Optional) Wire up the README-injection PreToolUse hook
 mkdir -p .claude
@@ -51,7 +51,7 @@ cat > .claude/settings.json <<'JSON'
     "PreToolUse": [
       { "matcher": "Read|Edit|Write|Glob|Grep",
         "hooks": [{ "type": "command",
-                    "command": "node tools/claude-docgen/inject-readme-context.mjs" }] }
+                    "command": "node tools/claude-code-auto-documentation/inject-readme-context.mjs" }] }
     ]
   }
 }
@@ -62,10 +62,10 @@ JSON
 
 ```bash
 # Analyse the whole repo (skips hand-written READMEs by default)
-tools/claude-docgen/docgen --until-done --parallel 4
+tools/claude-code-auto-documentation/docgen --until-done --parallel 4
 
 # Check progress
-tools/claude-docgen/docgen status
+tools/claude-code-auto-documentation/docgen status
 ```
 
 A typical repo bootstrap is ~$0.10–0.20 per directory (~25s per dir at
@@ -148,7 +148,7 @@ docgen --help                show this help
 
 `install-push-hook.sh` drops a tiny shim into your repo's git hooks
 (`.git/hooks/pre-push` or wherever your `core.hooksPath` points). The
-shim delegates to `claude-docgen/hooks/pre-push`. On every push:
+shim delegates to `claude-code-auto-documentation/hooks/pre-push`. On every push:
 
 1. Read the pre-push protocol's stdin to learn the exact SHA range
    being pushed.

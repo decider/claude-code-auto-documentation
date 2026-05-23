@@ -42,8 +42,8 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo '')"
 
 # Locate the docgen binary. Priority order:
 #   1. $DOCGEN_BIN env var (explicit override; tests + power users)
-#   2. `docgen` on PATH (npm install -g claude-docgen)
-#   3. Sibling to THIS script: <claude-docgen>/docgen (vendored install).
+#   2. `docgen` on PATH (npm install -g claude-code-auto-documentation)
+#   3. Sibling to THIS script: <claude-code-auto-documentation>/docgen (vendored install).
 #      Works because BASH_SOURCE resolves to this hook's TRUE path even
 #      when invoked as a shim from .git/hooks/pre-push.
 locate_docgen() {
@@ -64,7 +64,7 @@ locate_docgen() {
   return 1
 }
 DOCGEN_PATH="$(locate_docgen)" || {
-  echo "[$(date -u +%FT%TZ)] docgen binary not found — set DOCGEN_BIN, install claude-docgen on PATH, or use the vendored install pattern. aborting." >&2
+  echo "[$(date -u +%FT%TZ)] docgen binary not found — set DOCGEN_BIN, install claude-code-auto-documentation on PATH, or use the vendored install pattern. aborting." >&2
   exit 0
 }
 

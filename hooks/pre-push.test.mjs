@@ -40,8 +40,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const HERE = dirname(fileURLToPath(import.meta.url));   // claude-docgen/hooks
-const DOCGEN_DIR = dirname(HERE);                        // claude-docgen (this repo)
+const HERE = dirname(fileURLToPath(import.meta.url));   // claude-code-auto-documentation/hooks
+const DOCGEN_DIR = dirname(HERE);                        // claude-code-auto-documentation (this repo)
 
 /**
  * Build a self-contained test environment:
@@ -67,10 +67,10 @@ function setup() {
   // are unaffected — this is a per-test-clone override only.
   execFileSync('git', ['config', '--local', 'core.hooksPath', '.git/hooks'], { cwd: repo });
 
-  // 3. Vendor claude-docgen into the test repo at the path the README
+  // 3. Vendor claude-code-auto-documentation into the test repo at the path the README
   //    recommends — exercising the real production layout: a downstream
-  //    repo with claude-docgen sitting at `tools/claude-docgen/`.
-  const vendored = join(repo, 'tools/claude-docgen');
+  //    repo with claude-code-auto-documentation sitting at `tools/claude-code-auto-documentation/`.
+  const vendored = join(repo, 'tools/claude-code-auto-documentation');
   cpSync(DOCGEN_DIR, vendored, { recursive: true });
 
   // 4. Seed at least one file so docgen has something to work on, and
@@ -85,7 +85,7 @@ function setup() {
   // 5. Install the pre-push hook via the REAL installer (not a manual
   //    cpSync) so we test the shim-pointing-back-to-source pattern
   //    end-to-end. The installer drops a shim at .git/hooks/pre-push
-  //    that exec's `tools/claude-docgen/hooks/pre-push`, which in turn
+  //    that exec's `tools/claude-code-auto-documentation/hooks/pre-push`, which in turn
   //    locates `docgen` via $BASH_SOURCE → sibling.
   execFileSync(join(vendored, 'install-push-hook.sh'), ['install'], {
     cwd: repo,

@@ -12,9 +12,9 @@
 #
 # Install model: the installed file in `.git/hooks/pre-push` (or
 # wherever `core.hooksPath` points) is a tiny SHIM that exec's back to
-# this repo's source hook at `<claude-docgen>/hooks/pre-push`. The
+# this repo's source hook at `<claude-code-auto-documentation>/hooks/pre-push`. The
 # source hook locates `docgen` via $BASH_SOURCE → sibling, so it works
-# regardless of how claude-docgen was vendored into the target repo.
+# regardless of how claude-code-auto-documentation was vendored into the target repo.
 #
 # Coexistence: if `core.hooksPath` is already set (e.g. by another
 # tool like secret-scrub), we install our pre-push into THAT same dir
@@ -22,13 +22,13 @@
 
 set -euo pipefail
 
-# Resolve our own location. We're at <claude-docgen>/install-push-hook.sh.
+# Resolve our own location. We're at <claude-code-auto-documentation>/install-push-hook.sh.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_HOOK="$SELF/hooks/pre-push"
 
 if [ ! -x "$SOURCE_HOOK" ]; then
   echo "error: source hook not found / not executable at $SOURCE_HOOK" >&2
-  echo "Are you running this script from a corrupt claude-docgen checkout?" >&2
+  echo "Are you running this script from a corrupt claude-code-auto-documentation checkout?" >&2
   exit 1
 fi
 
@@ -60,7 +60,7 @@ write_shim() {
   local dest="$1"
   cat > "$dest" <<EOF
 #!/usr/bin/env bash
-# DOCGEN_PRE_PUSH_HOOK_v1 shim — managed by claude-docgen.
+# DOCGEN_PRE_PUSH_HOOK_v1 shim — managed by claude-code-auto-documentation.
 # This shim was installed by:
 #   $SELF/install-push-hook.sh
 # Real hook logic lives in:

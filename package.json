@@ -1,16 +1,16 @@
 {
-  "name": "claude-docgen",
+  "name": "claude-code-auto-documentation",
   "version": "0.1.0",
   "description": "Generate per-directory READMEs for Claude agents — an agent-optimized codebase index that auto-refreshes on push.",
   "license": "MIT",
   "author": "Daniel <decider@users.noreply.github.com>",
-  "homepage": "https://github.com/decider/claude-docgen",
+  "homepage": "https://github.com/decider/claude-code-auto-documentation",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/decider/claude-docgen.git"
+    "url": "git+https://github.com/decider/claude-code-auto-documentation.git"
   },
   "bugs": {
-    "url": "https://github.com/decider/claude-docgen/issues"
+    "url": "https://github.com/decider/claude-code-auto-documentation/issues"
   },
   "bin": {
     "docgen": "./docgen"
