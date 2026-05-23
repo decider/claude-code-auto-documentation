@@ -125,19 +125,19 @@ test('needsAnalysis: never-analyzed for an unseen dir', () => {
   }
 });
 
-test('needsAnalysis: null when file mtimes match state', () => {
+test('needsAnalysis: null when file content hashes match state', () => {
   const root = freshRepo();
   try {
-    const f = file(root, 'src/a.ts', 'a');
+    file(root, 'src/a.ts', 'a');
     const dir = join(root, 'src');
     const files = selectFiles(dir);
     const state = {
-      version: 1,
+      version: 2,
       lastRun: null,
       directories: {
         src: {
           lastAnalyzed: new Date().toISOString(),
-          files: Object.fromEntries(files.map((x) => [x.name, Math.floor(x.mtimeMs)])),
+          files: Object.fromEntries(files.map((x) => [x.name, x.hash])),
         },
       },
     };
@@ -147,26 +147,54 @@ test('needsAnalysis: null when file mtimes match state', () => {
   }
 });
 
-test('needsAnalysis: file-modified when a file mtime changes', () => {
+test('needsAnalysis: file-modified when file CONTENT changes (not just mtime)', () => {
   const root = freshRepo();
   try {
-    const f = file(root, 'src/a.ts', 'a');
+    const f = file(root, 'src/a.ts', 'original');
     const dir = join(root, 'src');
     const files = selectFiles(dir);
     const state = {
-      version: 1,
+      version: 2,
       lastRun: null,
       directories: {
         src: {
           lastAnalyzed: new Date().toISOString(),
-          files: Object.fromEntries(files.map((x) => [x.name, Math.floor(x.mtimeMs)])),
+          files: Object.fromEntries(files.map((x) => [x.name, x.hash])),
         },
       },
     };
-    // Bump mtime forward.
+    // Change content — hash will differ.
+    writeFileSync(f, 'modified content');
+    assert.equal(needsAnalysis(root, dir, state), 'file-modified');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('needsAnalysis: null when mtime changes but content is identical (durable across clones)', () => {
+  const root = freshRepo();
+  try {
+    const f = file(root, 'src/a.ts', 'unchanged');
+    const dir = join(root, 'src');
+    const files = selectFiles(dir);
+    const state = {
+      version: 2,
+      lastRun: null,
+      directories: {
+        src: {
+          lastAnalyzed: new Date().toISOString(),
+          files: Object.fromEntries(files.map((x) => [x.name, x.hash])),
+        },
+      },
+    };
+    // Touch the file — mtime advances, content is identical. This is
+    // exactly what happens on a fresh `git clone`: every file's mtime
+    // is the moment of checkout, NOT when it was last modified. With
+    // hash-based staleness, this scenario must NOT trigger re-analysis.
     const future = (Date.now() + 60_000) / 1000;
     utimesSync(f, future, future);
-    assert.equal(needsAnalysis(root, dir, state), 'file-modified');
+    assert.equal(needsAnalysis(root, dir, state), null,
+      'mtime change with identical content must NOT be flagged stale');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -179,12 +207,12 @@ test('needsAnalysis: file-set-changed when a new file appears', () => {
     const dir = join(root, 'src');
     const filesBefore = selectFiles(dir);
     const state = {
-      version: 1,
+      version: 2,
       lastRun: null,
       directories: {
         src: {
           lastAnalyzed: new Date().toISOString(),
-          files: Object.fromEntries(filesBefore.map((x) => [x.name, Math.floor(x.mtimeMs)])),
+          files: Object.fromEntries(filesBefore.map((x) => [x.name, x.hash])),
         },
       },
     };
@@ -312,9 +340,8 @@ test('computeStatus reports documented / stale / uncovered correctly', async () 
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'src') });
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'lib') });
 
-    // Stale-out src by mtime-bumping its file.
-    const future = (Date.now() + 60_000) / 1000;
-    utimesSync(join(root, 'src', 'a.ts'), future, future);
+    // Stale-out src by changing its file content (the hash will diff).
+    writeFileSync(join(root, 'src', 'a.ts'), 'a-modified');
 
     const s = computeStatus(root);
     // 4 total: src, lib, other, and `.` (root is a trunk).
@@ -433,10 +460,9 @@ test('needsAnalysis returns child-bumped when a child crosses minor boundary', a
     // Step 2: trunk pkg/ documented; records leaf at 0.1.0.
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg') });
 
-    // Now bump the leaf's file mtime so it's stale and analyse it again
-    // — this time it gets 0.2.0 (minor bump).
-    const future = (Date.now() + 60_000) / 1000;
-    utimesSync(join(root, 'pkg/leaf/a.ts'), future, future);
+    // Change the leaf's file content so its hash differs → re-analyse.
+    // The LLM returns 0.2.0 (minor bump) this time.
+    writeFileSync(join(root, 'pkg/leaf/a.ts'), 'a-modified');
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg/leaf') });
 
     // The trunk should now report child-bumped.
@@ -468,11 +494,10 @@ test('needsAnalysis: patch bump in child does NOT propagate to parent', async ()
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg/leaf') });
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg') });
 
-    // Touch the leaf file so it's stale, then re-analyse — but the LLM
-    // returns a PATCH version (cosmetic change only). Trunk must not
-    // propagate.
-    const future = (Date.now() + 60_000) / 1000;
-    utimesSync(join(root, 'pkg/leaf/a.ts'), future, future);
+    // Change the leaf file content so it's stale, then re-analyse —
+    // but the LLM returns a PATCH version (cosmetic change only).
+    // Trunk must NOT propagate.
+    writeFileSync(join(root, 'pkg/leaf/a.ts'), 'a-modified');
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg/leaf') });
 
     const state = loadState(root);
@@ -887,11 +912,11 @@ test('saveState + loadState round-trip without data loss', () => {
   const root = freshRepo();
   try {
     const s1 = {
-      version: 1,
+      version: 2,
       lastRun: '2026-05-22T22:00:00Z',
       directories: {
-        'a': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'x.ts': 123 } },
-        'b': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'y.ts': 456 } },
+        'a': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'x.ts': 'abc123' } },
+        'b': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'y.ts': 'def456' } },
       },
     };
     saveState(root, s1);

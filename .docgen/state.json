@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "lastRun": "2026-05-23T06:02:09.836Z",
+  "directories": {
+    ".github": {
+      "lastAnalyzed": "2026-05-23T06:01:58.917Z",
+      "reason": "forced",
+      "version": "0.1.1",
+      "files": {},
+      "childVersionsAtAnalysis": {
+        ".github/workflows": "0.1.1"
+      }
+    },
+    ".github/workflows": {
+      "lastAnalyzed": "2026-05-23T06:01:44.715Z",
+      "reason": "forced",
+      "version": "0.1.1",
+      "files": {
+        "test.yml": "2db9f33be8d1aeec8b6960ee4f9f1f41521203e94468d7453bb03438419d4a98"
+      },
+      "childVersionsAtAnalysis": {}
+    },
+    "hooks": {
+      "lastAnalyzed": "2026-05-23T06:02:09.836Z",
+      "reason": "forced",
+      "version": "0.2.0",
+      "files": {
+        "pre-push": "c2bd5cff6849c8ee9a5961bd182a3aac0e3415dd0819c8da9ed470bca55298ef",
+        "pre-push.test.mjs": "a959438e9023fb0050f2edd983d08a16129439ed9b50982986a6ae9fa7f38513"
+      },
+      "childVersionsAtAnalysis": {}
+    }
+  }
+}

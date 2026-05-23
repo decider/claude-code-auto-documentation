@@ -65,6 +65,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawn, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -143,15 +144,18 @@ function statePath(root) {
 
 export function loadState(root) {
   const p = statePath(root);
-  if (!existsSync(p)) return { version: 1, lastRun: null, directories: {} };
+  if (!existsSync(p)) return { version: 2, lastRun: null, directories: {} };
   try {
     const raw = readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw);
-    if (parsed && parsed.version === 1 && parsed.directories) return parsed;
+    // v2 = content-hash staleness. v1 was mtime-based; we drop v1
+    // silently — old states force a one-time re-bootstrap, which is
+    // the price of making state durable across fresh clones.
+    if (parsed && parsed.version === 2 && parsed.directories) return parsed;
   } catch {
     /* fall through */
   }
-  return { version: 1, lastRun: null, directories: {} };
+  return { version: 2, lastRun: null, directories: {} };
 }
 
 export function saveState(root, state) {
@@ -227,8 +231,22 @@ export function* walkDirs(root) {
   }
 }
 
+/** sha256 of a file's content, hex-encoded. Cheap (~ms per file at
+ *  typical source-file sizes). Returns null on read failure so the
+ *  caller treats it as "unable to verify" and skips. */
+function fileContentHash(path) {
+  try {
+    const data = readFileSync(path);
+    return createHash('sha256').update(data).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
 /** Pick the files in `dir` we'll feed to claude. Sorted by name for
- *  deterministic prompts. */
+ *  deterministic prompts. Each entry carries a content hash used by
+ *  needsAnalysis for staleness — content hash survives fresh clones,
+ *  unlike mtime which gets rewritten on checkout. */
 export function selectFiles(dir) {
   const out = [];
   let entries;
@@ -251,7 +269,9 @@ export function selectFiles(dir) {
       continue;
     }
     if (st.size > MAX_FILE_BYTES_HARD) continue;
-    out.push({ name: e.name, full, mtimeMs: st.mtimeMs, size: st.size });
+    const hash = fileContentHash(full);
+    if (!hash) continue; // unreadable; skip
+    out.push({ name: e.name, full, hash, size: st.size });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
@@ -492,7 +512,7 @@ export function needsAnalysis(root, dir, state) {
     if (curNames[i] !== prevNames[i]) return 'file-set-changed';
   }
   for (const f of files) {
-    if (Math.floor(prev[f.name] ?? 0) !== Math.floor(f.mtimeMs)) {
+    if ((prev[f.name] ?? '') !== f.hash) {
       return 'file-modified';
     }
   }
@@ -762,7 +782,7 @@ export async function analyzeOne(root, opts = {}) {
     lastAnalyzed: new Date().toISOString(),
     reason,
     version: finalVersion,
-    files: Object.fromEntries(files.map((f) => [f.name, Math.floor(f.mtimeMs)])),
+    files: Object.fromEntries(files.map((f) => [f.name, f.hash])),
     childVersionsAtAnalysis: Object.fromEntries(
       childReadmes.map((c) => [c.relPath, c.version]),
     ),
