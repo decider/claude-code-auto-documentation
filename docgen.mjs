@@ -571,8 +571,18 @@ function defaultRunner({ prompt, context, model, timeoutMs = DEFAULT_TIMEOUT_MS 
     proc.on('exit', (code) => {
       clearTimeout(timer);
       settle(() => {
-        if (code === 0) resolveP(stdout);
-        else rejectP(new Error(`docgen: claude exited ${code}: ${stderr.slice(0, 500)}`));
+        if (code === 0) { resolveP(stdout); return; }
+        const err = new Error(`docgen: claude exited ${code}: ${stderr.slice(0, 500)}`);
+        // Detect "cwd was deleted" — claude itself checks its own cwd
+        // before running and bails. Every subsequent call from a
+        // --until-done loop would fail the same way, so flag fatal so
+        // the outer loop halts instead of grinding forever (the
+        // runaway-zombie class of bug seen with worktree cleanup).
+        if (/current working directory was deleted|cwd .* deleted/i.test(stderr)) {
+          err.code = 'CWD_DELETED';
+          err.halt = true;
+        }
+        rejectP(err);
       });
     });
     proc.stdin.on('error', () => {});
@@ -954,20 +964,44 @@ export async function analyzeAllParallel(root, opts = {}) {
     );
 
     // Process the depth group in chunks of `parallel`. Within a chunk,
-    // Promise.all fans out; chunks themselves are serialised so we
-    // never have more than `parallel` calls running.
+    // Promise.allSettled fans out; chunks themselves are serialised so
+    // we never have more than `parallel` calls running. allSettled
+    // (vs all) means one slot throwing doesn't discard the OTHER
+    // concurrent results. The 'halt' detection below is the escape
+    // hatch for truly-fatal errors (cwd deleted).
     for (let i = 0; i < sameDepth.length; i += parallel) {
       const chunk = sameDepth.slice(i, i + parallel);
       onBatchStart?.({ depth: maxDepth, chunkSize: chunk.length });
-      const results = await Promise.all(
+      const settled = await Promise.allSettled(
         chunk.map((b) =>
           analyzeOne(root, { ...analyzeOpts, forceDir: b.dir }),
         ),
       );
-      for (const r of results) {
-        if (r.skipped) skipped++;
-        else if (r.picked) done++;
-        onProgress?.(r);
+      let halt = false;
+      for (let j = 0; j < settled.length; j++) {
+        const s = settled[j];
+        if (s.status === 'fulfilled') {
+          const r = s.value;
+          if (r.skipped) skipped++;
+          else if (r.picked) done++;
+          onProgress?.(r);
+        } else {
+          skipped++;
+          onProgress?.({
+            picked: chunk[j].dir,
+            skipped: 'error',
+            message: s.reason?.message ?? String(s.reason),
+          });
+          if (s.reason?.halt || s.reason?.code === 'CWD_DELETED') halt = true;
+        }
+      }
+      if (halt) {
+        onProgress?.({
+          picked: '<batch>',
+          skipped: 'halt',
+          message: 'cwd deleted (worktree cleanup); halting --until-done loop',
+        });
+        return { done, skipped, halted: true };
       }
     }
   }
@@ -1101,6 +1135,14 @@ async function main() {
   };
 
   if (args.flags.untilDone) {
+    // Sanity check before entering the loop — if our cwd is already
+    // gone (parent automation deleted the worktree before we got
+    // here), bail cleanly. Saves spawning a claude subprocess that
+    // would only return "cwd deleted" itself.
+    try { process.cwd(); } catch {
+      console.log('docgen: cwd no longer exists — refusing to enter --until-done loop');
+      process.exit(0);
+    }
     // When --dir is set alongside --until-done, fall through to the
     // single-shot path. That's the explicit "force one target, no loop"
     // contract; --parallel doesn't apply to a single target.
