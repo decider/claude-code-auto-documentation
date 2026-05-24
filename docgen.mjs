@@ -118,6 +118,16 @@ const MAX_FILE_BYTES_HARD = 1024 * 1024;
  *  prompt without informational value. */
 const MAX_FILES_PER_DIR = 60;
 
+/** Curated-context filenames (see collectCuratedContext for behavior).
+ *  Maintainers drop these to inject hand-written guidance into the
+ *  prompt without putting hand-written content inside the generated
+ *  README itself (which keeps the README cleanly regeneratable). */
+const CTX_GLOBAL_PATH = '.docgen/global.md';
+const CTX_LOCAL_FILENAME = '.docgen-context.md';
+const CTX_CASCADE_FILENAME = '.docgen-cascade.md';
+/** Cap per-context-file bytes folded into the prompt. */
+const MAX_CTX_BYTES = 4 * 1024;
+
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 
 // ─── repo + state ─────────────────────────────────────────────────────────
@@ -533,6 +543,22 @@ export function needsAnalysis(root, dir, state) {
       return `child-removed:${recordedRel}`;
     }
   }
+  // Curated-context file checks. Any new file, mtime bump, or removed
+  // file triggers a re-generation.
+  const recordedCtx = entry.curatedContextAtAnalysis || {};
+  const currentCtx = collectCuratedContext(root, dir);
+  for (const c of currentCtx) {
+    const recorded = recordedCtx[c.relPath];
+    if (recorded === undefined) return `context-added:${c.relPath}`;
+    if (Math.floor(recorded) !== Math.floor(c.mtimeMs)) {
+      return `context-modified:${c.relPath}`;
+    }
+  }
+  for (const recordedRel of Object.keys(recordedCtx)) {
+    if (!currentCtx.some((c) => c.relPath === recordedRel)) {
+      return `context-removed:${recordedRel}`;
+    }
+  }
   return null;
 }
 
@@ -608,8 +634,66 @@ function loadPrompt(scriptDir) {
  * the LLM into a summariser, not a re-grepper), and every selected
  * file as a fenced block. Files over the per-file cap are truncated.
  */
+/**
+ * Collect curated-context items for a directory's prompt. Returns an
+ * array of `{label, content, relPath, mtimeMs}` in priority order:
+ *
+ *   1. Global  — `<root>/.docgen/global.md` (every prompt)
+ *   2. Local   — `<dir>/.docgen-context.md` (only this dir's prompt)
+ *   3. Cascade — every `<descendant>/.docgen-cascade.md` (bubbles up)
+ *
+ * The bubble-up pattern is the load-bearing one: a single
+ * `.docgen-cascade.md` at `bots/scripts/backtest/factory/` (e.g.
+ * "available commands at this layer") flows into the prompts of
+ * every ancestor (`backtest/`, `scripts/`, `bots/`, `.`), so the
+ * generated README at each level naturally surfaces the same vocab.
+ *
+ * Each entry's `relPath` + `mtimeMs` is also persisted into state so
+ * `needsAnalysis` can re-trigger a re-generation when a context file
+ * changes — same shape as the existing per-file mtime tracking.
+ */
+export function collectCuratedContext(root, dir) {
+  const items = [];
+
+  const globalPath = join(root, CTX_GLOBAL_PATH);
+  if (existsSync(globalPath)) {
+    items.push({
+      label: 'Global context (.docgen/global.md)',
+      content: readFileSync(globalPath, 'utf8').slice(0, MAX_CTX_BYTES),
+      relPath: relative(root, globalPath),
+      mtimeMs: statSync(globalPath).mtimeMs,
+    });
+  }
+
+  const localPath = join(dir, CTX_LOCAL_FILENAME);
+  if (existsSync(localPath)) {
+    items.push({
+      label: `Local context (${relative(root, localPath)})`,
+      content: readFileSync(localPath, 'utf8').slice(0, MAX_CTX_BYTES),
+      relPath: relative(root, localPath),
+      mtimeMs: statSync(localPath).mtimeMs,
+    });
+  }
+
+  // Cascade: every descendant's .docgen-cascade.md bubbles into this
+  // dir's prompt. Reuses walkDirs so we get the same SKIP_DIRS filter
+  // (no node_modules, no .git, etc.).
+  for (const descendant of walkDirs(dir)) {
+    const cascadePath = join(descendant, CTX_CASCADE_FILENAME);
+    if (!existsSync(cascadePath)) continue;
+    items.push({
+      label: `Cascade context (${relative(root, cascadePath)})`,
+      content: readFileSync(cascadePath, 'utf8').slice(0, MAX_CTX_BYTES),
+      relPath: relative(root, cascadePath),
+      mtimeMs: statSync(cascadePath).mtimeMs,
+    });
+  }
+
+  return items;
+}
+
 export function assembleContext(root, dir, files, opts = {}) {
-  const { childReadmes = [], priorVersionStr = null } = opts;
+  const { childReadmes = [], priorVersionStr = null, curatedContext = [] } = opts;
   const rel = relative(root, dir) || '.';
   const lines = [`# Directory: ${rel}`, ''];
 
@@ -627,6 +711,22 @@ export function assembleContext(root, dir, files, opts = {}) {
     lines.push('No prior README — this is the first generation. Start at `0.1.0`.');
     lines.push('');
   }
+  // Curated context — hand-written guidance the maintainer wants the
+  // LLM to treat as authoritative. See collectCuratedContext for the
+  // three sources (global / local / cascade). Placed BEFORE child
+  // READMEs + raw files so the LLM frames the generated content
+  // around maintainer intent rather than re-deriving from scratch.
+  if (curatedContext.length > 0) {
+    lines.push('## Curated context (hand-written, treat as authoritative)');
+    lines.push('');
+    for (const item of curatedContext) {
+      lines.push(`### ${item.label}`);
+      lines.push('');
+      lines.push(item.content.trimEnd());
+      lines.push('');
+    }
+  }
+
 
   // Parent README for vocabulary continuity.
   const parentReadme = join(dirname(dir), 'README.md');
@@ -795,9 +895,11 @@ export async function analyzeOne(root, opts = {}) {
   }
 
   const priorV = priorVersion(target);
+  const curatedContext = collectCuratedContext(root, target);
   const context = assembleContext(root, target, files, {
     childReadmes,
     priorVersionStr: priorV,
+    curatedContext,
   });
 
   if (dryRun) {
@@ -870,6 +972,9 @@ export async function analyzeOne(root, opts = {}) {
     files: Object.fromEntries(files.map((f) => [f.name, f.hash])),
     childVersionsAtAnalysis: Object.fromEntries(
       childReadmes.map((c) => [c.relPath, c.version]),
+    ),
+    curatedContextAtAnalysis: Object.fromEntries(
+      curatedContext.map((c) => [c.relPath, Math.floor(c.mtimeMs)]),
     ),
   };
   await saveStateMerging(root, { [rel]: newEntry }, new Date().toISOString());
