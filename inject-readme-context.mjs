@@ -37,6 +37,17 @@ import {
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+
+/** Short content fingerprint for dedup. Two READMEs with byte-identical
+ *  content hash to the same key — so we never re-inject the same content
+ *  twice in a session, even when it lives at different absolute paths
+ *  (e.g. multiple worktrees of the same repo open in one Claude Code
+ *  session). 16 hex chars of sha1 is ample collision resistance for the
+ *  ~dozens of READMEs in a session. */
+function contentHash(text) {
+  return createHash('sha1').update(text).digest('hex').slice(0, 16);
+}
 
 // ─── config ───────────────────────────────────────────────────────────────
 
@@ -208,18 +219,14 @@ function main() {
       payload?.session_id ?? process.env.CLAUDE_SESSION_ID;
     if (sessionIdForReadme) {
       try {
-        // Canonicalise so /tmp vs /private/tmp doesn't break later
-        // ancestor-chain comparisons.
-        const canonicalReadme = (() => {
-          try {
-            return realpathSync(targetAbs);
-          } catch {
-            return targetAbs;
-          }
-        })();
+        // Mark this README as "seen this session" so any later ancestor walk
+        // doesn't re-inject any slice of it. Key on the FULL text so it
+        // matches whichever slice the inject loop would have chosen.
+        const text = readFileSync(targetAbs, 'utf8');
+        const key = contentHash(text);
         const dedup = loadDedup(sessionIdForReadme);
-        if (!dedup.has(canonicalReadme)) {
-          dedup.add(canonicalReadme);
+        if (!dedup.has(key)) {
+          dedup.add(key);
           saveDedup(sessionIdForReadme, dedup);
         }
       } catch { /* dedup is best-effort */ }
@@ -286,13 +293,21 @@ function main() {
       // sidecars (which CC does NOT load).
       if (basename === 'CLAUDE.md' && dir === canonicalRoot) continue;
       if (!existsSync(docPath)) continue;
-      if (dedup.has(docPath)) continue;
       let text;
       try {
         text = readFileSync(docPath, 'utf8');
       } catch {
         continue;
       }
+      // CONTENT-HASH dedup keyed on the FULL README text (not the slice we
+      // happen to inject this call): "this README has been shown to Claude
+      // this session" — whether previously as a leaf-full Map or as an
+      // ancestor Purpose, don't re-emit any slice of it. This also collapses
+      // sibling worktrees with byte-identical READMEs to a single injection,
+      // fixing the path-keyed dedup bug where the same content was injected
+      // 2–3× in one session.
+      const key = contentHash(text);
+      if (dedup.has(key)) continue;
       const meta = readmeMeta(text);
       let content;
       if (isClosest || basename === 'CLAUDE.md') {
@@ -305,7 +320,7 @@ function main() {
         meta,
         content,
       });
-      dedup.add(docPath);
+      dedup.add(key);
       dirHadDoc = true;
     }
     if (dirHadDoc) isClosest = false;
