@@ -47,11 +47,16 @@ ONE OR TWO sentences. What is this directory's job in the codebase?
 Why does it exist? Don't say "this directory contains files about X" —
 say "this is the X subsystem; it owns Y."
 
-## Files
-A bullet list, one per file, in the form:
-- `filename.ext` — one-sentence summary of what this file does and the
-  load-bearing functions / exports / responsibilities it owns. Lead
-  with the action ("computes", "owns", "wires", "tests"), not the type.
+## Map
+A pointer index — a jump-table into the code, not prose. One bullet per
+load-bearing RESPONSIBILITY (not necessarily one per file), in the form:
+- <concept an agent would search for> → `file.ext` · `Symbol`, `Symbol2`
+Lead with the concept ("per-bot tick loop", "at-rest wallet crypto"),
+then the file and the exported SYMBOL(S) to jump to. Use symbol names,
+never line numbers — line numbers go stale between regenerations; symbol
+names stay greppable. Fold trivial/boilerplate files into one line (e.g.
+`tests → *.test.ts`); don't pad to one-per-file. Cover every load-bearing
+file, but tersely, as pointers.
 
 ## Subdirectories
 ONLY IF immediate sub-directory READMEs are provided to you below
