@@ -21,6 +21,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import {
   loadState,
@@ -38,7 +39,6 @@ import {
   resolveVersion,
   findChildReadmesInState,
   isHandWrittenReadme,
-  expandScopeWithAncestors,
 } from './docgen.mjs';
 
 // ─── tmp-repo helpers ─────────────────────────────────────────────────────
@@ -125,19 +125,19 @@ test('needsAnalysis: never-analyzed for an unseen dir', () => {
   }
 });
 
-test('needsAnalysis: null when file content hashes match state', () => {
+test('needsAnalysis: null when file mtimes match state', () => {
   const root = freshRepo();
   try {
-    file(root, 'src/a.ts', 'a');
+    const f = file(root, 'src/a.ts', 'a');
     const dir = join(root, 'src');
     const files = selectFiles(dir);
     const state = {
-      version: 2,
+      version: 1,
       lastRun: null,
       directories: {
         src: {
           lastAnalyzed: new Date().toISOString(),
-          files: Object.fromEntries(files.map((x) => [x.name, x.hash])),
+          files: Object.fromEntries(files.map((x) => [x.name, Math.floor(x.mtimeMs)])),
         },
       },
     };
@@ -147,54 +147,26 @@ test('needsAnalysis: null when file content hashes match state', () => {
   }
 });
 
-test('needsAnalysis: file-modified when file CONTENT changes (not just mtime)', () => {
+test('needsAnalysis: file-modified when a file mtime changes', () => {
   const root = freshRepo();
   try {
-    const f = file(root, 'src/a.ts', 'original');
+    const f = file(root, 'src/a.ts', 'a');
     const dir = join(root, 'src');
     const files = selectFiles(dir);
     const state = {
-      version: 2,
+      version: 1,
       lastRun: null,
       directories: {
         src: {
           lastAnalyzed: new Date().toISOString(),
-          files: Object.fromEntries(files.map((x) => [x.name, x.hash])),
+          files: Object.fromEntries(files.map((x) => [x.name, Math.floor(x.mtimeMs)])),
         },
       },
     };
-    // Change content — hash will differ.
-    writeFileSync(f, 'modified content');
-    assert.equal(needsAnalysis(root, dir, state), 'file-modified');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('needsAnalysis: null when mtime changes but content is identical (durable across clones)', () => {
-  const root = freshRepo();
-  try {
-    const f = file(root, 'src/a.ts', 'unchanged');
-    const dir = join(root, 'src');
-    const files = selectFiles(dir);
-    const state = {
-      version: 2,
-      lastRun: null,
-      directories: {
-        src: {
-          lastAnalyzed: new Date().toISOString(),
-          files: Object.fromEntries(files.map((x) => [x.name, x.hash])),
-        },
-      },
-    };
-    // Touch the file — mtime advances, content is identical. This is
-    // exactly what happens on a fresh `git clone`: every file's mtime
-    // is the moment of checkout, NOT when it was last modified. With
-    // hash-based staleness, this scenario must NOT trigger re-analysis.
+    // Bump mtime forward.
     const future = (Date.now() + 60_000) / 1000;
     utimesSync(f, future, future);
-    assert.equal(needsAnalysis(root, dir, state), null,
-      'mtime change with identical content must NOT be flagged stale');
+    assert.equal(needsAnalysis(root, dir, state), 'file-modified');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -207,12 +179,12 @@ test('needsAnalysis: file-set-changed when a new file appears', () => {
     const dir = join(root, 'src');
     const filesBefore = selectFiles(dir);
     const state = {
-      version: 2,
+      version: 1,
       lastRun: null,
       directories: {
         src: {
           lastAnalyzed: new Date().toISOString(),
-          files: Object.fromEntries(filesBefore.map((x) => [x.name, x.hash])),
+          files: Object.fromEntries(filesBefore.map((x) => [x.name, Math.floor(x.mtimeMs)])),
         },
       },
     };
@@ -340,8 +312,9 @@ test('computeStatus reports documented / stale / uncovered correctly', async () 
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'src') });
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'lib') });
 
-    // Stale-out src by changing its file content (the hash will diff).
-    writeFileSync(join(root, 'src', 'a.ts'), 'a-modified');
+    // Stale-out src by mtime-bumping its file.
+    const future = (Date.now() + 60_000) / 1000;
+    utimesSync(join(root, 'src', 'a.ts'), future, future);
 
     const s = computeStatus(root);
     // 4 total: src, lib, other, and `.` (root is a trunk).
@@ -503,10 +476,11 @@ test('needsAnalysis: patch bump in child does NOT propagate to parent', async ()
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg/leaf') });
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg') });
 
-    // Change the leaf file content so it's stale, then re-analyse —
-    // but the LLM returns a PATCH version (cosmetic change only).
-    // Trunk must NOT propagate.
-    writeFileSync(join(root, 'pkg/leaf/a.ts'), 'a-modified');
+    // Touch the leaf file so it's stale, then re-analyse — but the LLM
+    // returns a PATCH version (cosmetic change only). Trunk must not
+    // propagate.
+    const future = (Date.now() + 60_000) / 1000;
+    utimesSync(join(root, 'pkg/leaf/a.ts'), future, future);
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg/leaf') });
 
     const state = loadState(root);
@@ -789,40 +763,36 @@ test('analyzeAllParallel keeps bottom-up ordering: trunk waits for leaves', asyn
   }
 });
 
-// ─── livelock guard ───────────────────────────────────────────────────────
-
 test('analyzeAllParallel analyses each dir at most once per run — livelock guard for dirs that keep mutating', async () => {
   const root = freshRepo();
   try {
-    // Two leaf dirs at the same depth. `loopy/` holds a file whose CONTENT
-    // changes during analysis — simulating an external process rewriting a
-    // file in the directory WHILE docgen is mid-sweep. Because analyzeOne
-    // records the file hashes BEFORE calling the runner, any content change
-    // that happens during the runner call means the recorded hash is already
-    // stale when the next outer iteration walks the tree. Without a guard,
-    // `loopy` is re-picked on every outer iteration → infinite loop.
+    // Two leaf dirs at the same depth. `loopy/` holds a file whose mtime
+    // gets bumped into the future by the runner on every analysis —
+    // simulating an external process (the live pre-push hook) re-touching
+    // the directory that holds it WHILE docgen is mid-sweep. Because
+    // analyzeOne snapshots file mtimes *before* calling the runner, the
+    // fingerprint it records is already stale, so without a guard `loopy`
+    // is re-picked on every outer iteration → infinite loop (observed in
+    // the wild on tools/secret-scrub/githooks: 5 rewrites, never drained).
     file(root, 'stable/a.ts', 'export const a = 1;');
     const loopyFile = file(root, 'loopy/hook.sh', '#!/bin/sh\necho hi\n');
 
     const calls = { loopy: 0, other: 0 };
     const churn = [];
-    let loopyCallCount = 0;
     const runner = async ({ context }) => {
       const m = context.match(/# Directory: (\S+)/);
       const dir = m ? m[1] : 'unknown';
       if (dir === 'loopy') {
         calls.loopy++;
-        loopyCallCount++;
         // Convert a regressed (infinite) loop into a clear test failure
         // instead of a hang.
         if (calls.loopy > 4) {
           throw new Error(`livelock: loopy analysed ${calls.loopy}× in one run`);
         }
-        // Mutate the file content DURING the runner call so the hash
-        // recorded by analyzeOne is already stale when the next outer
-        // iteration runs needsAnalysis → dir stays stale indefinitely
-        // without the livelock guard.
-        writeFileSync(loopyFile, `#!/bin/sh\necho hi_${loopyCallCount}\n`);
+        // External toucher: bump the source file's mtime into the future
+        // AFTER analyzeOne snapshotted it → dir stays needsAnalysis-positive.
+        const future = Date.now() + 60_000;
+        utimesSync(loopyFile, future / 1000, future / 1000);
       } else {
         calls.other++;
       }
@@ -848,129 +818,86 @@ test('analyzeAllParallel analyses each dir at most once per run — livelock gua
   }
 });
 
-// ─── --scope plumbing ─────────────────────────────────────────────────────
-
-test('expandScopeWithAncestors: file path → its parent dir + all ancestors', () => {
+test('saveState + loadState round-trip without data loss', () => {
   const root = freshRepo();
   try {
-    file(root, 'a/b/c/file.ts', 'x');
-    const expanded = expandScopeWithAncestors(root, [join(root, 'a/b/c/file.ts')]);
-    const rels = [...expanded].map((p) => p.replace(root + '/', '').replace(root, '.'));
-    assert.ok(rels.includes('a/b/c'), `expected a/b/c, got: ${rels}`);
-    assert.ok(rels.includes('a/b'), `expected a/b, got: ${rels}`);
-    assert.ok(rels.includes('a'), `expected a, got: ${rels}`);
-    assert.ok(rels.includes('.'), `expected . (root), got: ${rels}`);
+    const s1 = {
+      version: 1,
+      lastRun: '2026-05-22T22:00:00Z',
+      directories: {
+        'a': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'x.ts': 123 } },
+        'b': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'y.ts': 456 } },
+      },
+    };
+    saveState(root, s1);
+    const s2 = loadState(root);
+    assert.deepEqual(s2, s1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('expandScopeWithAncestors: directory path → itself + ancestors', () => {
+// ─── defensive ENOENT handling (worktree-cleanup race) ────────────────────
+
+test('analyzeOne returns skipped:"vanished" when target dir no longer exists', async () => {
   const root = freshRepo();
   try {
-    file(root, 'a/b/keep.ts', 'x'); // makes a/b a real dir
-    const expanded = expandScopeWithAncestors(root, [join(root, 'a/b')]);
-    const rels = [...expanded].map((p) => p.replace(root + '/', '').replace(root, '.'));
-    assert.ok(rels.includes('a/b'));
-    assert.ok(rels.includes('a'));
-    assert.ok(rels.includes('.'));
+    // Create a directory, then delete it before analyzeOne runs.
+    // Simulates the integrate-public-* worktree-cleanup race where a
+    // detached background docgen runs after the parent automation has
+    // rm -rf'd the worktree.
+    const gone = join(root, 'will-vanish');
+    mkdirSync(gone);
+    writeFileSync(join(gone, 'a.ts'), 'export const x = 1;\n');
+    rmSync(gone, { recursive: true, force: true });
+    const result = await analyzeOne(root, {
+      runner: async () => { throw new Error('runner should not be called for vanished dir'); },
+      promptText: 'unused',
+      forceDir: gone,
+    });
+    assert.equal(result.skipped, 'vanished');
+    assert.match(result.message ?? '', /no longer exists|cleaned mid-run/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('expandScopeWithAncestors: relative paths get resolved against root', () => {
+test('parallel batch survives one analyzeOne throwing — others still land', async () => {
   const root = freshRepo();
   try {
-    file(root, 'x/y/z.ts', 'x');
-    const expanded = expandScopeWithAncestors(root, ['x/y/z.ts']);
-    const rels = [...expanded].map((p) => p.replace(root + '/', '').replace(root, '.'));
-    assert.ok(rels.includes('x/y'), `expected x/y, got: ${rels}`);
-    assert.ok(rels.includes('x'));
-    assert.ok(rels.includes('.'));
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('expandScopeWithAncestors: paths outside root are dropped', () => {
-  const root = freshRepo();
-  try {
-    const expanded = expandScopeWithAncestors(root, ['/tmp/outside.ts']);
-    assert.equal(expanded.size, 0, 'paths outside root must be excluded');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('analyzeAllParallel with scope: only re-analyses dirs in scope + ancestors', async () => {
-  const root = freshRepo();
-  try {
-    file(root, 'touched/x.ts', 'a');
-    file(root, 'untouched/y.ts', 'b');
-
-    const analysed = [];
-    const mockRunner = async ({ context }) => {
+    // Build 3 sibling dirs at same depth. Mock runner throws for one,
+    // succeeds for the other two. Promise.allSettled in the batch
+    // loop means survivors must still get their READMEs written.
+    for (const name of ['a', 'b', 'c']) {
+      const d = join(root, name);
+      mkdirSync(d);
+      writeFileSync(join(d, 'f.ts'), `export const ${name} = 1;\n`);
+    }
+    const runner = async ({ context }) => {
       const dirMatch = context.match(/# Directory: (\S+)/);
-      analysed.push(dirMatch ? dirMatch[1] : '?');
-      return '<!-- docgen:version=0.1.0 reason: t -->\n\n## Purpose\n\nDone.';
+      const name = dirMatch ? dirMatch[1] : '';
+      if (name === 'b') throw new Error('synthetic upstream failure');
+      return `<!-- docgen:version=0.1.0 reason: ok -->\n\n## Purpose\n\n${name}.`;
     };
-
-    // Scope to just `touched/` — expanded should include `touched`
-    // and root `.`, but NOT `untouched/`.
-    const scope = expandScopeWithAncestors(root, [join(root, 'touched')]);
-
-    await analyzeAllParallel(root, {
-      runner: mockRunner,
+    const summary = await analyzeAllParallel(root, {
+      runner,
       promptText: PROMPT,
-      parallel: 1,
-      scope,
+      parallel: 3,
     });
-
-    assert.ok(analysed.includes('touched'), `touched should have been analysed: ${analysed}`);
-    assert.ok(!analysed.includes('untouched'),
-      `untouched must NOT have been analysed (out of scope): ${analysed}`);
-    assert.ok(analysed.includes('.'),
-      `root . SHOULD be analysed (ancestor of touched, so trunk bubble-up works): ${analysed}`);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('analyzeAllParallel with empty scope set: noop, no runner calls', async () => {
-  const root = freshRepo();
-  try {
-    file(root, 'src/a.ts', 'a');
-    let calls = 0;
-    const mockRunner = async () => {
-      calls++;
-      return '<!-- docgen:version=0.1.0 reason: t -->\n\n## Purpose\n\nDone.';
-    };
-
-    // Empty scope set = "analyse nothing". Guards the edge case where
-    // the hook computes an empty scope from a diff that touched only
-    // files we filter out (e.g. binaries, lock files).
-    await analyzeAllParallel(root, {
-      runner: mockRunner,
-      promptText: PROMPT,
-      parallel: 1,
-      scope: new Set(),
-    });
-    assert.equal(calls, 0, 'empty scope must produce zero runner calls');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('expandScopeWithAncestors: empty input → empty set', () => {
-  const root = freshRepo();
-  try {
-    assert.equal(expandScopeWithAncestors(root, []).size, 0);
-    assert.equal(
-      expandScopeWithAncestors(root, [null, undefined, ''].filter(Boolean)).size,
-      0,
-      'falsy entries should be silently dropped',
-    );
+    // a + c (survivors) + the root trunk = 3. b throws and is skipped —
+    // and, crucially, NOT retried: before the livelock guard, b (which
+    // never gets a state entry) was re-picked at the deepest depth on
+    // every outer iteration, so the sweep hung forever and never reached
+    // the root trunk. Now it drains and the trunk gets documented despite
+    // a sibling failing.
+    assert.equal(summary.done, 3);
+    assert.ok(summary.skipped >= 1);
+    assert.equal(existsSync(join(root, 'a/README.md')), true);
+    assert.equal(existsSync(join(root, 'c/README.md')), true);
+    assert.equal(existsSync(join(root, 'README.md')), true,
+      'root trunk should be documented even though sibling b failed');
+    assert.equal(existsSync(join(root, 'b/README.md')), false,
+      'the dir whose runner threw must NOT have a README');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1054,20 +981,188 @@ test('analyzeAllParallel without --changed: full sweep analyzes all dirs', async
   }
 });
 
-test('saveState + loadState round-trip without data loss', () => {
+// ─── Change 1: data-only dir skip ─────────────────────────────────────────
+
+test('needsAnalysis: data-only dir (json+csv, no children) returns null', () => {
   const root = freshRepo();
   try {
-    const s1 = {
-      version: 2,
-      lastRun: '2026-05-22T22:00:00Z',
-      directories: {
-        'a': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'x.ts': 'abc123' } },
-        'b': { lastAnalyzed: '2026-05-22T22:00:00Z', files: { 'y.ts': 'def456' } },
-      },
+    file(root, 'data/records.json', '[{"a":1}]');
+    file(root, 'data/prices.csv', 'date,price\n2024-01-01,1.0\n');
+    const state = loadState(root);
+    const result = needsAnalysis(root, join(root, 'data'), state);
+    assert.equal(result, null, `data-only dir must be skipped; got: ${result}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('needsAnalysis: sibling dir with .ts is analyzed (not data-only)', () => {
+  const root = freshRepo();
+  try {
+    file(root, 'data/records.json', '[{"a":1}]');
+    file(root, 'src/index.ts', 'export const x = 1;');
+    const state = loadState(root);
+    const srcResult = needsAnalysis(root, join(root, 'src'), state);
+    assert.ok(srcResult !== null, `src dir with .ts must be analyzed; got: ${srcResult}`);
+    const dataResult = needsAnalysis(root, join(root, 'data'), state);
+    assert.equal(dataResult, null, `data-only dir must still be skipped; got: ${dataResult}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('needsAnalysis: mixed dir (.ts + .json) is analyzed (NOT skipped)', () => {
+  const root = freshRepo();
+  try {
+    file(root, 'pkg/a.ts', 'export const a = 1;');
+    file(root, 'pkg/b.json', '{"key":"value"}');
+    const state = loadState(root);
+    const result = needsAnalysis(root, join(root, 'pkg'), state);
+    assert.ok(result !== null, `mixed dir must NOT be skipped; got: ${result}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('needsAnalysis: dir with only .sql files is analyzed (not data-only)', () => {
+  const root = freshRepo();
+  try {
+    file(root, 'migrations/001.sql', 'CREATE TABLE foo (id INT);');
+    file(root, 'migrations/002.sql', 'ALTER TABLE foo ADD col TEXT;');
+    const state = loadState(root);
+    const result = needsAnalysis(root, join(root, 'migrations'), state);
+    assert.ok(result !== null, `.sql-only dir must NOT be skipped; got: ${result}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('needsAnalysis: prose-only dir (.md) is SKIPPED — no code symbols to map', () => {
+  const root = freshRepo();
+  try {
+    file(root, 'docs/guide.md', '# Guide\n\nSome guide.');
+    file(root, 'docs/api.md', '# API\n\nSome API docs.');
+    const state = loadState(root);
+    assert.equal(needsAnalysis(root, join(root, 'docs'), state), null,
+      'prose-only (.md) dir must be skipped');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('needsAnalysis: research dir (hypothesis.md + status.json, no code) is SKIPPED', () => {
+  // The real pbx-platform failure mode: ~12k dirs each a .md writeup + .json
+  // data, no code. Must be skipped, not documented.
+  const root = freshRepo();
+  try {
+    file(root, 'strategies/0001/hypothesis.md', '# Hypothesis\n\nidea.');
+    file(root, 'strategies/0001/status.json', '{"done":true}');
+    const state = loadState(root);
+    assert.equal(needsAnalysis(root, join(root, 'strategies/0001'), state), null,
+      'data+prose research dir (no code) must be skipped');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('needsAnalysis: data-only dir WITH documented children is analyzed (trunk role)', async () => {
+  // A dir that holds only .json files but also has a documented child subdir
+  // acts as a trunk. It should NOT be skipped even if its own files are data.
+  const root = freshRepo();
+  try {
+    file(root, 'data/records.json', '[{"a":1}]');
+    file(root, 'data/processed/index.ts', 'export const x = 1;');
+    // Analyze the child so it has a state entry + README.
+    const mockRunner = async () =>
+      '<!-- docgen:version=0.1.0 reason: t -->\n\n## Purpose\n\nDone.';
+    await analyzeOne(root, {
+      runner: mockRunner,
+      promptText: PROMPT,
+      forceDir: join(root, 'data/processed'),
+    });
+    const state = loadState(root);
+    const result = needsAnalysis(root, join(root, 'data'), state);
+    assert.ok(result !== null, `data dir with documented children must NOT be skipped; got: ${result}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ─── Change 2: selectFiles respects .gitignore (tracked-only) ─────────────
+
+test('selectFiles excludes gitignored and untracked files, includes tracked ones', () => {
+  const root = mkdtempSync(join(tmpdir(), 'docgen-git-'));
+  try {
+    // Initialise a real git repo so ls-files works.
+    execFileSync('git', ['init', '-b', 'main'], { cwd: root, stdio: 'pipe' });
+    execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: root, stdio: 'pipe' });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: root, stdio: 'pipe' });
+
+    // pkg/ with:
+    //   - tracked.ts       (git add + commit → tracked)
+    //   - ignored.json     (in .gitignore → not tracked)
+    //   - untracked.ts     (present on disk, never added → untracked)
+    mkdirSync(join(root, 'pkg'));
+    writeFileSync(join(root, 'pkg', 'tracked.ts'), 'export const x = 1;');
+    writeFileSync(join(root, 'pkg', 'ignored.json'), '{"ignored":true}');
+    writeFileSync(join(root, '.gitignore'), 'pkg/ignored.json\n');
+    execFileSync('git', ['add', 'pkg/tracked.ts', '.gitignore'], { cwd: root, stdio: 'pipe' });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: root, stdio: 'pipe' });
+
+    // Create untracked.ts AFTER commit, so it's on disk but not tracked.
+    writeFileSync(join(root, 'pkg', 'untracked.ts'), 'export const y = 2;');
+
+    const files = selectFiles(join(root, 'pkg'), root).map((f) => f.name);
+    assert.ok(files.includes('tracked.ts'), 'tracked.ts must be included');
+    assert.ok(!files.includes('ignored.json'), 'gitignored file must be excluded');
+    assert.ok(!files.includes('untracked.ts'), 'untracked file must be excluded');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('selectFiles falls back to full behavior when not in a git repo', () => {
+  // In a non-git dir (our freshRepo() — no git init), tracked-set is null
+  // and all otherwise-eligible files should still be returned.
+  const root = freshRepo();
+  try {
+    file(root, 'pkg/a.ts', 'export const a = 1;');
+    file(root, 'pkg/b.ts', 'export const b = 2;');
+    // Pass root explicitly so selectFiles can look up the tracked set.
+    const files = selectFiles(join(root, 'pkg'), root).map((f) => f.name);
+    assert.ok(files.includes('a.ts'), 'a.ts must be included in non-git repo');
+    assert.ok(files.includes('b.ts'), 'b.ts must be included in non-git repo');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ─── Change 3: --max run-size guard ───────────────────────────────────────
+
+test('analyzeAllParallel: --max 2 stops after 2 dirs even when 5+ are actionable', async () => {
+  const root = freshRepo();
+  try {
+    // 5 sibling leaf dirs — all actionable on a fresh repo.
+    for (let i = 0; i < 5; i++) {
+      file(root, `dir${i}/a.ts`, `export const x${i} = ${i};`);
+    }
+    let callCount = 0;
+    const mockRunner = async ({ context }) => {
+      callCount++;
+      const dirMatch = context.match(/# Directory: (\S+)/);
+      const dirName = dirMatch ? dirMatch[1] : 'unknown';
+      return `<!-- docgen:version=0.1.0 reason: test -->\n\n## Purpose\n\n${dirName}.`;
     };
-    saveState(root, s1);
-    const s2 = loadState(root);
-    assert.deepEqual(s2, s1);
+
+    const { done } = await analyzeAllParallel(root, {
+      runner: mockRunner,
+      promptText: PROMPT,
+      parallel: 4,
+      max: 2,
+    });
+
+    assert.equal(done, 2, `--max 2 must stop after 2 dirs; got done=${done}`);
+    assert.equal(callCount, 2, `runner must be called exactly 2 times; got ${callCount}`);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
