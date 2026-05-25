@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # Resolve our own location. We're at <claude-code-auto-documentation>/install-push-hook.sh.
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_HOOK="$SELF/hooks/pre-push"
 
 if [ ! -x "$SOURCE_HOOK" ]; then
@@ -32,7 +32,7 @@ if [ ! -x "$SOURCE_HOOK" ]; then
   exit 1
 fi
 
-GIT_ROOT="$(git rev-parse --show-toplevel)"
+GIT_ROOT="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
 cd "$GIT_ROOT"
 HOOKS_PATH="$(git config core.hooksPath || echo '')"
 
@@ -79,7 +79,7 @@ install() {
   if [ -f "$dest" ] && ! grep -q 'DOCGEN_PRE_PUSH_HOOK_v1' "$dest" 2>/dev/null; then
     warn "$dest already exists and isn't ours — refusing to overwrite."
     info "remove or back it up, then re-run install."
-    exit 1
+    return 1
   fi
 
   mkdir -p "$(dirname "$dest")"
@@ -120,9 +120,72 @@ status() {
   fi
 }
 
+# ─── auto-wire .claude/settings.json (progressive disclosure + self-heal) ───
+# Idempotently add two hooks to the consumer repo's .claude/settings.json:
+#   • PreToolUse  -> inject-readme-context.mjs : feeds per-directory READMEs
+#     into Claude's context when it Reads/Edits/etc a file (progressive
+#     disclosure — the docs always make it in, scoped to where Claude works).
+#   • SessionStart -> re-install the push hook each session (self-healing,
+#     since the installed git hook is untracked and can go missing).
+# Paths are computed relative to the git root, so this works no matter where
+# the tool is vendored. Never clobbers existing hooks; safe to re-run.
+wire_settings() {
+  local rel prefix inject_cmd install_cmd
+  if [ "$SELF" = "$GIT_ROOT" ]; then rel=""; else rel="${SELF#$GIT_ROOT/}"; fi
+  if [ -n "$rel" ]; then prefix="$rel/"; else prefix=""; fi
+  inject_cmd="node ${prefix}inject-readme-context.mjs"
+  install_cmd="bash ${prefix}install-push-hook.sh install >/dev/null 2>&1 || true"
+  python3 - "$inject_cmd" "$install_cmd" <<'PY'
+import json, os, sys
+inject_cmd, install_cmd = sys.argv[1], sys.argv[2]
+p = ".claude/settings.json"
+os.makedirs(".claude", exist_ok=True)
+try:
+    with open(p) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+hooks = data.setdefault("hooks", {})
+def has(event, cmd):
+    return any(h.get("command") == cmd
+              for g in hooks.get(event, []) for h in g.get("hooks", []))
+changed = []
+if not has("PreToolUse", inject_cmd):
+    hooks.setdefault("PreToolUse", []).append(
+        {"matcher": "Read|Edit|Write|Glob|Grep",
+         "hooks": [{"type": "command", "command": inject_cmd}]})
+    changed.append("PreToolUse")
+if not has("SessionStart", install_cmd):
+    hooks.setdefault("SessionStart", []).append(
+        {"hooks": [{"type": "command", "command": install_cmd}]})
+    changed.append("SessionStart")
+if changed:
+    with open(p, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print("WIRED " + " ".join(changed))
+else:
+    print("ALREADY-WIRED")
+PY
+}
+
+setup() {
+  install || warn "push-hook install skipped (see above) — wiring context injection anyway."
+  echo
+  info "wiring progressive-disclosure inject hook + SessionStart self-install into .claude/settings.json…"
+  local res; res="$(wire_settings)"
+  case "$res" in
+    WIRED*)        ok "settings.json updated: ${res#WIRED }" ;;
+    ALREADY-WIRED) info "settings.json already wired — nothing to add." ;;
+    *)             warn "settings.json wiring result: $res" ;;
+  esac
+  ok "setup complete — docs auto-refresh on push AND inject into Claude's context on file access."
+}
+
 case "${1:-install}" in
-  install)   install ;;
+  install)   install || exit 1 ;;
   uninstall) uninstall ;;
   status)    status ;;
-  *) echo "usage: $0 [install|uninstall|status]" >&2; exit 1 ;;
+  setup)     setup ;;
+  *) echo "usage: $0 [install|uninstall|status|setup]" >&2; exit 1 ;;
 esac
