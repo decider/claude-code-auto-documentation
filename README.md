@@ -38,7 +38,9 @@ up to parent READMEs when there's a material (minor+) change.
 ### One-time setup in a repo
 
 ```bash
-# 1. Vendor claude-code-auto-documentation into your repo (or `npm install -g claude-code-auto-documentation`)
+# 1. Vendor claude-code-auto-documentation into your repo via git clone.
+#    (An `npm install -g claude-code-auto-documentation` path is coming soon —
+#     the package isn't published to npm yet, so use git clone for now.)
 git clone https://github.com/decider/claude-code-auto-documentation.git tools/claude-code-auto-documentation
 
 # 2. (Optional) Install the auto-refresh-on-push hook
