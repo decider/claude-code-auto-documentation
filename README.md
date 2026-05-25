@@ -43,23 +43,24 @@ up to parent READMEs when there's a material (minor+) change.
 #     the package isn't published to npm yet, so use git clone for now.)
 git clone https://github.com/decider/claude-code-auto-documentation.git tools/claude-code-auto-documentation
 
-# 2. (Optional) Install the auto-refresh-on-push hook
-tools/claude-code-auto-documentation/install-push-hook.sh install
-
-# 3. (Optional) Wire up the README-injection PreToolUse hook
-mkdir -p .claude
-cat > .claude/settings.json <<'JSON'
-{
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "Read|Edit|Write|Glob|Grep",
-        "hooks": [{ "type": "command",
-                    "command": "node tools/claude-code-auto-documentation/inject-readme-context.mjs" }] }
-    ]
-  }
-}
-JSON
+# 2. One command wires everything (idempotent — safe to re-run, never
+#    clobbers existing hooks). It installs the auto-refresh-on-push hook,
+#    AND merges into .claude/settings.json: the README-injection
+#    PreToolUse hook (progressive-disclosure context) + a SessionStart
+#    hook that re-installs the push hook each session (self-healing).
+tools/claude-code-auto-documentation/install-push-hook.sh setup
 ```
+
+> **Activation (works mid-session too):** if you run `setup` from inside a
+> Claude Code session, the `PreToolUse` inject hook goes live
+> **immediately** — Claude Code's settings file-watcher reloads hooks
+> mid-session, so the next file `Read`/`Edit` already injects the relevant
+> READMEs. No restart, no `/reload-plugins`, no approval prompt. (The
+> `SessionStart` self-heal hook only fires on your *next* session, but
+> `setup` already installed the push hook now, so nothing else is needed.)
+
+The individual steps are still available if you want them à la carte:
+`install-push-hook.sh install` (push hook only), `… status`, `… uninstall`.
 
 ### Bootstrap the READMEs
 
