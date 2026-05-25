@@ -8,11 +8,15 @@
 # Fires before each `git push`. Spawns a detached background process
 # that waits a few seconds (so the user's actual push completes), then:
 #
-#   1. runs `tools/docgen/docgen --until-done --parallel 4`
-#   2. if any README.md files changed, commits them locally
-#   3. pushes the doc-refresh commit back to the same branch (with
+#   1. computes which directories changed in the push (via git diff)
+#   2. runs `docgen --until-done --parallel 4 --changed "..."`
+#      so only changed dirs (and their ancestors) are re-analysed.
+#      Falls back to a full sweep if computing the changed set fails or
+#      comes up empty.
+#   3. if any README.md files changed, commits them locally
+#   4. pushes the doc-refresh commit back to the same branch (with
 #      DOCGEN_HOOK_SKIP=1 so this same hook doesn't loop)
-#   4. if the push fails because the branch is gone server-side (PR
+#   5. if the push fails because the branch is gone server-side (PR
 #      already merged + branch deleted), opens a NEW follow-up PR via
 #      `gh pr create` with just the doc updates
 #
@@ -161,17 +165,24 @@ cd "$ROOT"
     fi
   done
 
-  # Run docgen. With --scope set we only re-analyse touched dirs +
-  # their ancestors; trunks still bubble up via the version mechanism.
-  # No scope = full walk (cold caches, manual triggers).
+  # Run docgen — scoped to changed dirs if we have them, full sweep otherwise.
+  # --changed takes comma-separated relative dir paths and expands each to
+  # include its ancestor dirs up to root, so trunk bubble-up still fires.
   if [ -n "$scope_paths" ]; then
-    docgen_args=(--until-done --parallel 4 --scope "$scope_paths")
+    echo "changed dirs: $scope_paths"
+    if ! "$DOCGEN_PATH" --until-done --parallel 4 --changed "$scope_paths"; then
+      echo "docgen (scoped) failed; retrying full sweep"
+      if ! "$DOCGEN_PATH" --until-done --parallel 4; then
+        echo "docgen failed (see above)"
+        exit 0
+      fi
+    fi
   else
-    docgen_args=(--until-done --parallel 4)
-  fi
-  if ! "$DOCGEN_PATH" "${docgen_args[@]}"; then
-    echo "docgen failed (see above)"
-    exit 0
+    echo "no changed-dir scope available; running full sweep"
+    if ! "$DOCGEN_PATH" --until-done --parallel 4; then
+      echo "docgen failed (see above)"
+      exit 0
+    fi
   fi
 
   if [ -z "$(git status --porcelain)" ]; then

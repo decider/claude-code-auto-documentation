@@ -22,9 +22,10 @@ READMEs actually load-bearing in practice.
    READMEs before any `Read` / `Edit` / `Grep` / `Glob` — so the next
    agent that navigates your code transparently sees them.
 3. **A `git pre-push` hook** that refreshes only the dirs whose files
-   changed in the push (via `git diff` + `--scope`), commits the
-   refresh, and pushes it back. If the branch was merged + deleted in
-   the meantime, it opens a fresh follow-up PR via `gh`.
+   changed in the push (via `git diff` + `--changed`), commits the
+   refresh, and pushes it back. Falls back to a full sweep if the diff
+   is unavailable. If the branch was merged + deleted in the meantime,
+   it opens a fresh follow-up PR via `gh`.
 
 Every generated README starts with a marker so humans + agents know
 it's auto-generated, and a semver version line so changes only bubble
@@ -110,10 +111,11 @@ Each README carries a version:
 <!-- docgen:version=0.3.1 reason: line numbers shifted -->
 ```
 
-When a leaf README gets a **patch** bump (cosmetic only), its parent
-trunk does NOT need to re-analyze. Only **minor** (material) or
-**major** (structural) bumps bubble up. This keeps push-time refreshes
-cheap.
+When a leaf README gets a **patch** or **minor** bump, its parent
+trunk does NOT need to re-analyze. Only a **major** bump (the child's
+purpose fundamentally changed) bubbles up. This keeps push-time
+refreshes cheap: a new file or renamed function in a leaf no longer
+cascades all the way to the root.
 
 ---
 
@@ -137,12 +139,25 @@ docgen status                print coverage report (no analysis)
 docgen --dir <path>          force-analyze a specific directory
 docgen --force --dir <path>  overwrite a hand-written README (opt-in)
 docgen --scope a,b,c         restrict walk to dirs (a, b, c) + their ancestors
+docgen --changed a,b,c       same as --scope but takes relative dir names
+                             (used by the pre-push hook for the push diff)
 docgen --dry-run             print what would be analyzed, don't call claude
 docgen --help                show this help
 
 --model <name>               override claude model
 --timeout-ms <n>             per-call timeout (default 300000)
 --parallel <n>               max concurrent claude calls within a depth (default 1)
+--changed <dirs>             comma-separated relative dir paths; restricts
+                             analysis to those dirs and all their ancestor dirs
+                             up to the repo root. Any dir not in that set is
+                             skipped entirely. When absent (default), the full
+                             repo sweep runs as usual.
+```
+
+Example — re-analyse only `src/server` and its ancestors:
+
+```bash
+docgen --until-done --parallel 4 --changed "src/server"
 ```
 
 ---
@@ -158,7 +173,8 @@ shim delegates to `claude-code-auto-documentation/hooks/pre-push`. On every push
 2. Fork a detached background process; the user's push isn't blocked.
 3. Wait 5s (let the foreground push settle).
 4. Compute `git diff --name-only <remote_sha>..HEAD` → unique dirs.
-5. Run `docgen --until-done --parallel 4 --scope <those dirs>`.
+5. Run `docgen --until-done --parallel 4 --changed <those dirs>`
+   (falls back to full sweep if the diff is unavailable).
 6. If READMEs changed: commit + push back to the same branch (with
    `DOCGEN_HOOK_SKIP=1` so the hook noops on its own pushes — loop
    guard).

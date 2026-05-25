@@ -43,6 +43,13 @@
  *                                the pre-push hook to refresh only the
  *                                dirs containing files in the diff,
  *                                much cheaper than a full re-walk.
+ *   --changed <dirs>             comma-separated relative dir paths to
+ *                                restrict analysis to (plus ancestors).
+ *                                Same semantics as --scope but takes
+ *                                relative directory names rather than
+ *                                file paths — used by the pre-push hook
+ *                                to pass the push diff's changed dirs.
+ *                                Absent = full sweep (default).
  *   --model <name>               override claude model (default: cli default)
  *   --timeout-ms <n>             per-call timeout (default 300000 = 5 min)
  *
@@ -527,15 +534,24 @@ export function needsAnalysis(root, dir, state) {
     }
   }
 
-  // Child-version checks. Compare major.minor only — patch bumps in
-  // children are deliberately ignored.
+  // Child-version checks. Only a child's MAJOR bump cascades up to its
+  // parent — minor AND patch bumps stay local. Per prompt.md's version
+  // semantics a MAJOR bump means the child's purpose changed or it was
+  // restructured top-to-bottom (its old README is "essentially obsolete")
+  // — so the one-line summary the parent's index carries for that child
+  // is now wrong too, and the parent must be re-generated. A minor bump
+  // (new file, a responsibility moved, a renamed function) or a patch
+  // (cosmetic) leaves the parent's index-level description of the child
+  // still accurate, so re-generating the whole ancestor chain for it is
+  // needless cost. (A newly-added or removed child still always
+  // re-triggers the parent — see below.)
   const recordedChildren = entry.childVersionsAtAnalysis || {};
   for (const c of childReadmes) {
     const recorded = recordedChildren[c.relPath];
     if (!recorded) return `child-added:${c.relPath}`;
-    const [rM, rm] = recorded.split('.').map(Number);
-    const [cM, cm] = c.version.split('.').map(Number);
-    if (rM !== cM || rm !== cm) return `child-bumped:${c.relPath}`;
+    const [rM] = recorded.split('.').map(Number);
+    const [cM] = c.version.split('.').map(Number);
+    if (rM !== cM) return `child-bumped:${c.relPath}`;
   }
   // A child we previously summarised has disappeared (dir removed).
   for (const recordedRel of Object.keys(recordedChildren)) {
@@ -1038,11 +1054,47 @@ export async function analyzeAllParallel(root, opts = {}) {
     onProgress,
     onBatchStart,
     scope,                // Set<string> of absolute dir paths, or null
+    changed,              // string[] of relative dir paths (--changed flag); builds scope
     ...analyzeOpts
   } = opts;
 
+  // When --changed is provided, build the effective scope set from those
+  // relative dir paths + all their ancestor dirs up to root. This is the
+  // same expansion that --scope uses; --changed is the CLI surface and
+  // this is the internal plumbing.
+  let effectiveScope = scope ?? null;
+  if (changed && changed.length > 0 && !effectiveScope) {
+    effectiveScope = new Set();
+    for (const relDir of changed) {
+      let abs = resolve(root, relDir);
+      // Walk from the changed dir up to (and including) root.
+      while (true) {
+        effectiveScope.add(abs);
+        if (abs === root) break;
+        const parent = dirname(abs);
+        if (parent === abs) break; // filesystem root guard
+        abs = parent;
+      }
+    }
+  }
+
   let done = 0;
   let skipped = 0;
+
+  // Livelock guard. The outer loop re-walks the tree each iteration so a
+  // freshly-written child README becomes visible to its trunk's staleness
+  // check. But a directory whose OWN files keep mutating mid-run — e.g.
+  // a pre-push file whose mtime gets bumped by hook re-installs while
+  // this very sweep runs — stays needsAnalysis-positive forever and is
+  // re-picked on every iteration, so the loop never drains.
+  //
+  // Because we process strictly bottom-up (children before trunks), no
+  // directory ever LEGITIMATELY needs analysing twice in a single run. So
+  // we analyse each dir at most once per invocation. A dir still flagged
+  // stale after its turn is surfaced as "churn" (not silently dropped)
+  // and then skipped.
+  const analyzedThisRun = new Set();
+  const churnReported = new Set();
 
   // Outer loop: each iteration handles ONE depth level. We re-walk the
   // tree each time so freshly-written child READMEs become visible to
@@ -1051,12 +1103,27 @@ export async function analyzeAllParallel(root, opts = {}) {
     const state = loadState(root);
     const actionable = [];
     for (const dir of walkDirs(root)) {
-      // When --scope is in effect, only consider dirs in that scope.
+      // When --scope / --changed is in effect, only consider dirs in that scope.
       // Scope is pre-expanded to include ancestors, so trunk bubble-up
       // still fires for parents of the touched leaves.
-      if (scope && !scope.has(dir)) continue;
+      if (effectiveScope && !effectiveScope.has(dir)) continue;
       const reason = needsAnalysis(root, dir, state);
-      if (reason) actionable.push({ dir, reason });
+      if (!reason) continue;
+      if (analyzedThisRun.has(dir)) {
+        if (!churnReported.has(dir)) {
+          churnReported.add(dir);
+          onProgress?.({
+            picked: relative(root, dir) || '.',
+            skipped: 'churn',
+            message:
+              'still stale after analysis this run — files are changing ' +
+              'under docgen (a live hook re-touching its own dir?); ' +
+              'skipping to avoid a livelock',
+          });
+        }
+        continue;
+      }
+      actionable.push({ dir, reason });
     }
     if (actionable.length === 0) break;
 
@@ -1076,6 +1143,9 @@ export async function analyzeAllParallel(root, opts = {}) {
     // hatch for truly-fatal errors (cwd deleted).
     for (let i = 0; i < sameDepth.length; i += parallel) {
       const chunk = sameDepth.slice(i, i + parallel);
+      // Mark dispatched dirs as done-for-this-run BEFORE awaiting, so even
+      // if their files mutate during analysis they are never re-queued.
+      for (const b of chunk) analyzedThisRun.add(b.dir);
       onBatchStart?.({ depth: maxDepth, chunkSize: chunk.length });
       const settled = await Promise.allSettled(
         chunk.map((b) =>
@@ -1162,6 +1232,10 @@ function parseArgs(argv) {
     else if (a === '--timeout-ms') out.flags.timeoutMs = Number(argv[++i]);
     else if (a === '--parallel') out.flags.parallel = Math.max(1, Number(argv[++i]) || 1);
     else if (a === '--scope') out.flags.scope = argv[++i];
+    else if (a === '--changed') {
+      const raw = argv[++i] ?? '';
+      out.flags.changed = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    }
     else out.positional.push(a);
   }
   return out;
@@ -1267,6 +1341,9 @@ async function main() {
     // ancestor of each path) so a push-driven refresh only re-analyses
     // dirs containing files that just changed, while still letting
     // trunk bubble-up reach root through their ancestors.
+    // --changed <comma-sep-relative-dirs>: same semantics as --scope but
+    // takes relative dir paths (not file paths) — used by the pre-push
+    // hook to pass the push diff's changed directories.
     let scopeSet = null;
     if (args.flags.scope) {
       const rawPaths = args.flags.scope
@@ -1280,12 +1357,20 @@ async function main() {
       scopeSet = expandScopeWithAncestors(canonicalRoot, rawPaths);
       console.log(`docgen: --scope restricts walk to ${scopeSet.size} dir(s) (paths + ancestors)`);
     }
+    // --changed builds a scope from relative dir paths (the hook passes these).
+    // If both --scope and --changed are given, --scope wins.
+    let changedDirs = null;
+    if (args.flags.changed && args.flags.changed.length > 0 && !scopeSet) {
+      changedDirs = args.flags.changed;
+      console.log(`docgen: --changed restricts walk to ${changedDirs.length} dir(s) + ancestors`);
+    }
     let count = 0;
     const t0 = Date.now();
     const { done, skipped } = await analyzeAllParallel(root, {
       ...runOpts,
       parallel,
       scope: scopeSet,
+      changed: changedDirs,
       onBatchStart: ({ depth, chunkSize }) => {
         console.log(`docgen: → batch at depth ${depth} (${chunkSize} in parallel)`);
       },
