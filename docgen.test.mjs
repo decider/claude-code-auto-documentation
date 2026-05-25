@@ -440,7 +440,7 @@ test('walkDirsBottomUp yields deepest dirs first', () => {
 
 // ─── child-version-triggered bubble-up ────────────────────────────────────
 
-test('needsAnalysis returns child-bumped when a child crosses minor boundary', async () => {
+test('cascade is MAJOR-only: a child minor bump does NOT propagate, a major bump does', async () => {
   const root = freshRepo();
   try {
     file(root, 'pkg/leaf/a.ts', 'a');
@@ -449,9 +449,9 @@ test('needsAnalysis returns child-bumped when a child crosses minor boundary', a
     let v = 0;
     const mockRunner = async () => {
       v++;
-      // First call → leaf gets 0.1.0; second call → trunk pkg/ gets
-      // 0.1.0; third call → leaf re-analysed at 0.2.0 (minor bump).
-      const versions = ['0.1.0', '0.1.0', '0.2.0'];
+      // 1: leaf 0.1.0  2: trunk pkg/ 0.1.0 (records leaf@0.1.0)
+      // 3: leaf 0.2.0 (MINOR bump)  4: leaf 1.0.0 (MAJOR bump)
+      const versions = ['0.1.0', '0.1.0', '0.2.0', '1.0.0'];
       return `<!-- docgen:version=${versions[v - 1]} reason: test -->\n\n## Purpose\n\nDone.`;
     };
 
@@ -460,17 +460,26 @@ test('needsAnalysis returns child-bumped when a child crosses minor boundary', a
     // Step 2: trunk pkg/ documented; records leaf at 0.1.0.
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg') });
 
-    // Change the leaf's file content so its hash differs → re-analyse.
-    // The LLM returns 0.2.0 (minor bump) this time.
-    writeFileSync(join(root, 'pkg/leaf/a.ts'), 'a-modified');
+    // MINOR bump: re-analyse the leaf so it lands 0.2.0. Under the
+    // major-only cascade, the trunk must NOT be flagged stale by this.
+    let future = (Date.now() + 60_000) / 1000;
+    utimesSync(join(root, 'pkg/leaf/a.ts'), future, future);
     await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg/leaf') });
+    assert.equal(
+      needsAnalysis(root, join(root, 'pkg'), loadState(root)),
+      null,
+      'a child MINOR bump must NOT cascade to the parent',
+    );
 
-    // The trunk should now report child-bumped.
-    const state = loadState(root);
-    const reason = needsAnalysis(root, join(root, 'pkg'), state);
+    // MAJOR bump: re-analyse the leaf so it lands 1.0.0. Now the trunk's
+    // recorded child major (0) differs → it must be flagged child-bumped.
+    future = (Date.now() + 120_000) / 1000;
+    utimesSync(join(root, 'pkg/leaf/a.ts'), future, future);
+    await analyzeOne(root, { runner: mockRunner, promptText: PROMPT, forceDir: join(root, 'pkg/leaf') });
+    const reason = needsAnalysis(root, join(root, 'pkg'), loadState(root));
     assert.ok(
       reason && reason.startsWith('child-bumped:'),
-      `expected child-bumped reason, got: ${reason}`,
+      `a child MAJOR bump must cascade to the parent; got: ${reason}`,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -780,6 +789,65 @@ test('analyzeAllParallel keeps bottom-up ordering: trunk waits for leaves', asyn
   }
 });
 
+// ─── livelock guard ───────────────────────────────────────────────────────
+
+test('analyzeAllParallel analyses each dir at most once per run — livelock guard for dirs that keep mutating', async () => {
+  const root = freshRepo();
+  try {
+    // Two leaf dirs at the same depth. `loopy/` holds a file whose CONTENT
+    // changes during analysis — simulating an external process rewriting a
+    // file in the directory WHILE docgen is mid-sweep. Because analyzeOne
+    // records the file hashes BEFORE calling the runner, any content change
+    // that happens during the runner call means the recorded hash is already
+    // stale when the next outer iteration walks the tree. Without a guard,
+    // `loopy` is re-picked on every outer iteration → infinite loop.
+    file(root, 'stable/a.ts', 'export const a = 1;');
+    const loopyFile = file(root, 'loopy/hook.sh', '#!/bin/sh\necho hi\n');
+
+    const calls = { loopy: 0, other: 0 };
+    const churn = [];
+    let loopyCallCount = 0;
+    const runner = async ({ context }) => {
+      const m = context.match(/# Directory: (\S+)/);
+      const dir = m ? m[1] : 'unknown';
+      if (dir === 'loopy') {
+        calls.loopy++;
+        loopyCallCount++;
+        // Convert a regressed (infinite) loop into a clear test failure
+        // instead of a hang.
+        if (calls.loopy > 4) {
+          throw new Error(`livelock: loopy analysed ${calls.loopy}× in one run`);
+        }
+        // Mutate the file content DURING the runner call so the hash
+        // recorded by analyzeOne is already stale when the next outer
+        // iteration runs needsAnalysis → dir stays stale indefinitely
+        // without the livelock guard.
+        writeFileSync(loopyFile, `#!/bin/sh\necho hi_${loopyCallCount}\n`);
+      } else {
+        calls.other++;
+      }
+      return `<!-- docgen:version=0.1.0 reason: ${dir} -->\n\n## Purpose\n\n${dir}.`;
+    };
+
+    const summary = await analyzeAllParallel(root, {
+      runner,
+      promptText: PROMPT,
+      parallel: 2,
+      onProgress: (r) => { if (r.skipped === 'churn') churn.push(r.picked); },
+    });
+
+    // The mutating dir is analysed EXACTLY once despite staying stale.
+    assert.equal(calls.loopy, 1, `loopy must be analysed once, was ${calls.loopy}`);
+    // And the churn is surfaced (not silently swallowed) so an operator
+    // can see a dir is changing underneath docgen.
+    assert.ok(churn.includes('loopy'), 'expected a churn signal for loopy');
+    // Sweep still terminated and did real work on the other dirs.
+    assert.ok(summary.done >= 1, `expected progress, done=${summary.done}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ─── --scope plumbing ─────────────────────────────────────────────────────
 
 test('expandScopeWithAncestors: file path → its parent dir + all ancestors', () => {
@@ -903,6 +971,84 @@ test('expandScopeWithAncestors: empty input → empty set', () => {
       0,
       'falsy entries should be silently dropped',
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ─── --changed scope filter ───────────────────────────────────────────────
+
+test('analyzeAllParallel --changed: only changed dir + ancestors are analyzed, unrelated sibling is not', async () => {
+  const root = freshRepo();
+  try {
+    // Tree: pkg/leaf/leaf.ts, pkg/trunk.ts, other/sibling.ts
+    // changed: ['pkg/leaf'] → should analyze pkg/leaf AND pkg AND root (.),
+    // but NOT other/.
+    file(root, 'pkg/leaf/leaf.ts', 'export const leaf = 1;');
+    file(root, 'pkg/trunk.ts', 'export const trunk = 1;');
+    file(root, 'other/sibling.ts', 'export const sibling = 1;');
+
+    const analyzedDirs = [];
+    const mockRunner = async ({ context }) => {
+      const dirMatch = context.match(/# Directory: (\S+)/);
+      const dirName = dirMatch ? dirMatch[1] : 'unknown';
+      analyzedDirs.push(dirName);
+      return `<!-- docgen:version=0.1.0 reason: test -->\n\n## Purpose\n\nDone for ${dirName}.`;
+    };
+
+    await analyzeAllParallel(root, {
+      runner: mockRunner,
+      promptText: PROMPT,
+      parallel: 2,
+      changed: ['pkg/leaf'],
+    });
+
+    // pkg/leaf, pkg, and root (.) must be analyzed.
+    assert.ok(analyzedDirs.includes('pkg/leaf'), `pkg/leaf must be analyzed; got: ${analyzedDirs}`);
+    assert.ok(analyzedDirs.includes('pkg'), `pkg must be analyzed (ancestor); got: ${analyzedDirs}`);
+    assert.ok(analyzedDirs.includes('.'), `root must be analyzed (ancestor); got: ${analyzedDirs}`);
+
+    // other/ must NOT be analyzed.
+    assert.ok(!analyzedDirs.includes('other'), `other/ must NOT be analyzed; got: ${analyzedDirs}`);
+
+    // other/README.md must not exist.
+    assert.equal(existsSync(join(root, 'other', 'README.md')), false,
+      'other/README.md must not exist when other/ is excluded by --changed');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('analyzeAllParallel without --changed: full sweep analyzes all dirs', async () => {
+  const root = freshRepo();
+  try {
+    // Same tree as above but no --changed → all dirs must be analyzed.
+    file(root, 'pkg/leaf/leaf.ts', 'export const leaf = 1;');
+    file(root, 'pkg/trunk.ts', 'export const trunk = 1;');
+    file(root, 'other/sibling.ts', 'export const sibling = 1;');
+
+    const analyzedDirs = [];
+    const mockRunner = async ({ context }) => {
+      const dirMatch = context.match(/# Directory: (\S+)/);
+      const dirName = dirMatch ? dirMatch[1] : 'unknown';
+      analyzedDirs.push(dirName);
+      return `<!-- docgen:version=0.1.0 reason: test -->\n\n## Purpose\n\nDone for ${dirName}.`;
+    };
+
+    await analyzeAllParallel(root, {
+      runner: mockRunner,
+      promptText: PROMPT,
+      parallel: 2,
+      // no `changed` — full sweep
+    });
+
+    // All dirs must be analyzed: pkg/leaf, pkg, other, root (.).
+    for (const expected of ['pkg/leaf', 'pkg', 'other', '.']) {
+      assert.ok(analyzedDirs.includes(expected),
+        `${expected} must be analyzed in full sweep; got: ${analyzedDirs}`);
+    }
+    assert.equal(existsSync(join(root, 'other', 'README.md')), true,
+      'other/README.md must exist in full sweep');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
