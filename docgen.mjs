@@ -24,6 +24,11 @@
  *                                  at the same tree depth — leaves at
  *                                  depth N parallelise, trunks at N-1
  *                                  wait for their children.
+ *   docgen --until-done --parallel 4 --changed "a/b,c/d"
+ *                                analyze ONLY dirs whose files changed
+ *                                (comma-separated relative paths) plus
+ *                                all their ancestor dirs. Full-sweep when
+ *                                --changed is absent.
  *   docgen status                print coverage report (no analysis)
  *   docgen --dir <path>          force-analyze a specific directory
  *   docgen --force --dir <path>  overwrite a hand-written README (opt-in)
@@ -35,20 +40,8 @@
  *                                dirs at the same depth ever run
  *                                concurrently; bottom-up ordering is
  *                                preserved across depths.
- *   --scope <paths>              comma-separated list of paths (files or
- *                                dirs) to restrict the walk to. Each
- *                                path is expanded to include itself and
- *                                every ancestor up to repo root, so
- *                                trunk bubble-up still works. Used by
- *                                the pre-push hook to refresh only the
- *                                dirs containing files in the diff,
- *                                much cheaper than a full re-walk.
  *   --changed <dirs>             comma-separated relative dir paths to
  *                                restrict analysis to (plus ancestors).
- *                                Same semantics as --scope but takes
- *                                relative directory names rather than
- *                                file paths — used by the pre-push hook
- *                                to pass the push diff's changed dirs.
  *                                Absent = full sweep (default).
  *   --model <name>               override claude model (default: cli default)
  *   --timeout-ms <n>             per-call timeout (default 300000 = 5 min)
@@ -72,8 +65,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawn, execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ─── config ───────────────────────────────────────────────────────────────
@@ -113,6 +105,30 @@ const SKIP_FILE_EXT = new Set([
   '.mp3', '.mp4', '.mov', '.wav', '.webm',
   '.bin', '.wasm', '.so', '.dylib', '.dll', '.exe',
   '.ttf', '.otf', '.woff', '.woff2', '.eot',
+]);
+
+/**
+ * Non-code file extensions. A directory whose EVERY file has one of these
+ * (and has no documented children) has no code symbols to map, so
+ * needsAnalysis skips it.
+ *
+ * Covers DATA (.json/.csv/…) AND PROSE/markup (.md/.rst/…): a research
+ * output dir of `hypothesis.md` + `status.json`, or a pure docs dir, has
+ * nothing to point an agent at — and such dirs are exactly what explode
+ * docgen on data-heavy repos (one repo had ~12k of them). `.sql` STAYS
+ * documentable (schemas / migration logic count as code).
+ */
+const DATA_EXTENSIONS = new Set([
+  // data
+  '.json', '.jsonl', '.ndjson',
+  '.csv', '.tsv',
+  '.txt', '.xml',
+  '.yaml', '.yml',
+  '.toml', '.ini',
+  '.geojson',
+  '.parquet',
+  // prose / markup (no code symbols to point at)
+  '.md', '.markdown', '.rst', '.adoc', '.html', '.htm',
 ]);
 
 /** Per-file cap for the prompt. Larger files get truncated with a marker
@@ -155,24 +171,58 @@ function repoRoot() {
   }
 }
 
+// ─── git-tracked-files set (for .gitignore / untracked filtering) ─────────
+
+/** Cache keyed by repo root absolute path → Set<string> of absolute paths, or
+ *  null if not a git repo / git unavailable. Computed once per root per
+ *  process. */
+const _trackedFilesCache = new Map();
+
+/**
+ * Return the set of git-tracked absolute file paths for `root`, or null
+ * if `root` is not inside a git repo (or git is not available).
+ * Memoized at module level so `selectFiles` calls across the same run are
+ * cheap.
+ */
+function trackedFilesForRoot(root) {
+  if (_trackedFilesCache.has(root)) return _trackedFilesCache.get(root);
+  let result = null;
+  try {
+    const raw = execFileSync('git', ['ls-files', '-z'], {
+      cwd: root,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      // A large repo can return megabytes; 50 MB should be ample.
+      maxBuffer: 50 * 1024 * 1024,
+    });
+    const tracked = new Set();
+    for (const rel of raw.toString().split('\0')) {
+      if (rel) tracked.add(join(root, rel));
+    }
+    result = tracked;
+  } catch {
+    // Not a git repo, git not installed, or some transient error —
+    // fall back to unfiltered behaviour.
+    result = null;
+  }
+  _trackedFilesCache.set(root, result);
+  return result;
+}
+
 function statePath(root) {
   return join(root, '.docgen', 'state.json');
 }
 
 export function loadState(root) {
   const p = statePath(root);
-  if (!existsSync(p)) return { version: 2, lastRun: null, directories: {} };
+  if (!existsSync(p)) return { version: 1, lastRun: null, directories: {} };
   try {
     const raw = readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw);
-    // v2 = content-hash staleness. v1 was mtime-based; we drop v1
-    // silently — old states force a one-time re-bootstrap, which is
-    // the price of making state durable across fresh clones.
-    if (parsed && parsed.version === 2 && parsed.directories) return parsed;
+    if (parsed && parsed.version === 1 && parsed.directories) return parsed;
   } catch {
     /* fall through */
   }
-  return { version: 2, lastRun: null, directories: {} };
+  return { version: 1, lastRun: null, directories: {} };
 }
 
 export function saveState(root, state) {
@@ -248,23 +298,18 @@ export function* walkDirs(root) {
   }
 }
 
-/** sha256 of a file's content, hex-encoded. Cheap (~ms per file at
- *  typical source-file sizes). Returns null on read failure so the
- *  caller treats it as "unable to verify" and skips. */
-function fileContentHash(path) {
-  try {
-    const data = readFileSync(path);
-    return createHash('sha256').update(data).digest('hex');
-  } catch {
-    return null;
-  }
-}
-
-/** Pick the files in `dir` we'll feed to claude. Sorted by name for
- *  deterministic prompts. Each entry carries a content hash used by
- *  needsAnalysis for staleness — content hash survives fresh clones,
- *  unlike mtime which gets rewritten on checkout. */
-export function selectFiles(dir) {
+/**
+ * Pick the files in `dir` we'll feed to claude. Sorted by name for
+ * deterministic prompts.
+ *
+ * When `root` is supplied, only git-TRACKED files are returned (respecting
+ * .gitignore and excluding untracked files). If `root` is omitted or the
+ * directory is not inside a git repo, the original unfiltered behaviour
+ * applies. Call sites inside the automatic walk always supply `root`; the
+ * two-argument form is also used by tests.
+ */
+export function selectFiles(dir, root) {
+  const tracked = root ? trackedFilesForRoot(root) : null;
   const out = [];
   let entries;
   try {
@@ -279,6 +324,10 @@ export function selectFiles(dir) {
     if (SKIP_FILE_EXT.has(extname(e.name).toLowerCase())) continue;
     if (e.name.startsWith('.')) continue;
     const full = join(dir, e.name);
+    // If we have a tracked-files set, drop anything not in it. This
+    // respects .gitignore AND skips untracked files (e.g. build outputs
+    // that landed outside SKIP_DIRS).
+    if (tracked !== null && !tracked.has(full)) continue;
     let st;
     try {
       st = statSync(full);
@@ -286,9 +335,7 @@ export function selectFiles(dir) {
       continue;
     }
     if (st.size > MAX_FILE_BYTES_HARD) continue;
-    const hash = fileContentHash(full);
-    if (!hash) continue; // unreadable; skip
-    out.push({ name: e.name, full, hash, size: st.size });
+    out.push({ name: e.name, full, mtimeMs: st.mtimeMs, size: st.size });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
@@ -308,52 +355,6 @@ export function walkDirsBottomUp(root) {
     const depthDiff = b.split('/').length - a.split('/').length;
     return depthDiff !== 0 ? depthDiff : a.localeCompare(b);
   });
-}
-
-/**
- * Expand a list of paths (file paths OR directory paths) into the set
- * of directories that includes them AND every ancestor directory up to
- * (but not above) `root`. Used by --scope to keep trunk bubble-up
- * working: if a file in `bots/src/server/` changed, the parent trunks
- * `bots/src/` and `bots/` may also need refreshing because their child
- * versions may have bumped.
- *
- * Inputs:
- *   - paths: absolute or repo-relative paths (files or dirs)
- *   - root:  repo root (absolute, canonicalised)
- *
- * Returns: Set of absolute paths inside `root`. Paths outside `root`
- * are silently dropped.
- */
-export function expandScopeWithAncestors(root, paths) {
-  const out = new Set();
-  const canonicalRoot = root;
-  for (const p of paths) {
-    if (!p) continue;
-    let abs = isAbsolute(p) ? p : resolve(root, p);
-    // If `abs` is a file, start from its parent dir. If it's a dir
-    // (or doesn't exist — e.g. removed by the diff), use it directly.
-    let dir;
-    try {
-      const st = existsSync(abs) ? statSync(abs) : null;
-      dir = st && st.isFile() ? dirname(abs) : abs;
-    } catch {
-      dir = abs;
-    }
-    // Walk up until we leave the repo root.
-    let current = dir;
-    while (
-      current === canonicalRoot ||
-      (current.startsWith(canonicalRoot + '/') && current.length > canonicalRoot.length)
-    ) {
-      out.add(current);
-      if (current === canonicalRoot) break;
-      const parent = dirname(current);
-      if (parent === current) break;
-      current = parent;
-    }
-  }
-  return out;
 }
 
 /**
@@ -510,11 +511,20 @@ export function resolveVersion(priorV, llmV, fileSetChanged) {
 export function needsAnalysis(root, dir, state) {
   const rel = relative(root, dir) || '.';
   const entry = state.directories[rel];
-  const files = selectFiles(dir);
+  const files = selectFiles(dir, root);
   const childReadmes = findChildReadmesInState(root, dir, state);
   // Nothing to document — no own files, no documented children.
   if (files.length === 0 && childReadmes.length === 0) return null;
   if (files.length > MAX_FILES_PER_DIR) return null; // generated/asset dir
+  // No-code skip: a directory whose every file is data OR prose/markup
+  // (no code symbols to point an agent at) is skipped — UNLESS it has
+  // documented children, in which case it acts as a trunk summarising
+  // those children and still gets a README.
+  if (
+    files.length > 0 &&
+    files.every((f) => DATA_EXTENSIONS.has(extname(f.name).toLowerCase())) &&
+    childReadmes.length === 0
+  ) return null;
   // Protected: existing README is hand-written. Skip silently from the
   // automatic walk; users wanting to convert can pass `--force --dir`.
   if (isHandWrittenReadme(join(dir, 'README.md'))) return null;
@@ -529,7 +539,7 @@ export function needsAnalysis(root, dir, state) {
     if (curNames[i] !== prevNames[i]) return 'file-set-changed';
   }
   for (const f of files) {
-    if ((prev[f.name] ?? '') !== f.hash) {
+    if (Math.floor(prev[f.name] ?? 0) !== Math.floor(f.mtimeMs)) {
       return 'file-modified';
     }
   }
@@ -559,8 +569,10 @@ export function needsAnalysis(root, dir, state) {
       return `child-removed:${recordedRel}`;
     }
   }
+
   // Curated-context file checks. Any new file, mtime bump, or removed
-  // file triggers a re-generation.
+  // file triggers a re-generation. Same semantic as own-files: if the
+  // input to the prompt changed, the output is stale.
   const recordedCtx = entry.curatedContextAtAnalysis || {};
   const currentCtx = collectCuratedContext(root, dir);
   for (const c of currentCtx) {
@@ -615,11 +627,12 @@ function defaultRunner({ prompt, context, model, timeoutMs = DEFAULT_TIMEOUT_MS 
       settle(() => {
         if (code === 0) { resolveP(stdout); return; }
         const err = new Error(`docgen: claude exited ${code}: ${stderr.slice(0, 500)}`);
-        // Detect "cwd was deleted" — claude itself checks its own cwd
-        // before running and bails. Every subsequent call from a
-        // --until-done loop would fail the same way, so flag fatal so
-        // the outer loop halts instead of grinding forever (the
-        // runaway-zombie class of bug seen with worktree cleanup).
+        // Detect the "current working directory was deleted" failure
+        // — claude itself checks its own cwd before running and bails.
+        // When this fires, EVERY subsequent call from --until-done will
+        // also fail the same way, so flag it as fatal so the outer
+        // loop halts instead of retrying forever (the runaway-zombie
+        // class of bug). See checkAbortCwdDeleted in analyzeAllParallel.
         if (/current working directory was deleted|cwd .* deleted/i.test(stderr)) {
           err.code = 'CWD_DELETED';
           err.halt = true;
@@ -727,11 +740,18 @@ export function assembleContext(root, dir, files, opts = {}) {
     lines.push('No prior README — this is the first generation. Start at `0.1.0`.');
     lines.push('');
   }
+
   // Curated context — hand-written guidance the maintainer wants the
-  // LLM to treat as authoritative. See collectCuratedContext for the
-  // three sources (global / local / cascade). Placed BEFORE child
-  // READMEs + raw files so the LLM frames the generated content
-  // around maintainer intent rather than re-deriving from scratch.
+  // LLM to treat as authoritative when generating this README. Pulled
+  // from three locations (see collectCuratedContext):
+  //   .docgen/global.md            — applies to every dir's prompt
+  //   <dir>/.docgen-context.md     — only this dir's prompt
+  //   <descendant>/.docgen-cascade.md — bubbles up into every ancestor's
+  //                                     prompt (use for "available
+  //                                     commands at this layer" etc)
+  // Comes BEFORE child READMEs + raw files so the LLM frames the
+  // generated content around the maintainer's intent rather than
+  // re-deriving from scratch.
   if (curatedContext.length > 0) {
     lines.push('## Curated context (hand-written, treat as authoritative)');
     lines.push('');
@@ -742,7 +762,6 @@ export function assembleContext(root, dir, files, opts = {}) {
       lines.push('');
     }
   }
-
 
   // Parent README for vocabulary continuity.
   const parentReadme = join(dirname(dir), 'README.md');
@@ -799,21 +818,36 @@ export function assembleContext(root, dir, files, opts = {}) {
 // ─── analysis core ────────────────────────────────────────────────────────
 
 /** Inspect the user's local clone for our pre-push hook. Returns
- *  `{installed, reason}` — `reason` explains the specific gap so the
- *  status output can be actionable rather than just "not installed."
- *  Recognises 4 install layouts: vanilla `.git/hooks/pre-push`, chained
- *  `.git/hooks/pre-push-local`, plus both at `core.hooksPath` if set. */
+ *  `{installed: bool, reason: string}` — `reason` explains the
+ *  specific gap so the status output can be actionable rather than
+ *  just "not installed."
+ *
+ *  Three install layouts to recognise:
+ *    1. .git/hooks/pre-push                   — vanilla install
+ *    2. <core.hooksPath>/pre-push             — shared hooks dir
+ *    3. .git/hooks/pre-push-local             — chained alongside
+ *                                                another global hook
+ *                                                (e.g. an identity
+ *                                                guard) that exec's
+ *                                                pre-push-local at end
+ *  Any one being present + executable + carrying our MARKER counts.
+ */
 function checkPreHookInstalled(root) {
   const MARKER = 'DOCGEN_PRE_PUSH_HOOK_v1';
   const gitDirRaw = (() => {
-    try { return execFileSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8' }).trim(); }
-    catch { return null; }
+    try {
+      return execFileSync('git', ['rev-parse', '--git-dir'], {
+        cwd: root, encoding: 'utf8',
+      }).trim();
+    } catch { return null; }
   })();
   if (!gitDirRaw) return { installed: false, reason: 'not in a git repo' };
   const gitDir = resolve(root, gitDirRaw);
   const hooksPath = (() => {
     try {
-      const p = execFileSync('git', ['config', 'core.hooksPath'], { cwd: root, encoding: 'utf8' }).trim();
+      const p = execFileSync('git', ['config', 'core.hooksPath'], {
+        cwd: root, encoding: 'utf8',
+      }).trim();
       return p ? resolve(root, p) : null;
     } catch { return null; }
   })();
@@ -825,12 +859,14 @@ function checkPreHookInstalled(root) {
   for (const path of candidates) {
     if (!existsSync(path)) continue;
     try {
-      if (readFileSync(path, 'utf8').includes(MARKER)) {
-        return { installed: true, reason: `via ${relative(root, path)}` };
-      }
+      const content = readFileSync(path, 'utf8');
+      if (content.includes(MARKER)) return { installed: true, reason: `via ${relative(root, path)}` };
     } catch { /* skip */ }
   }
-  return { installed: false, reason: 'no pre-push file carries the docgen marker (DOCGEN_PRE_PUSH_HOOK_v1)' };
+  return {
+    installed: false,
+    reason: 'no pre-push file carries the docgen marker (DOCGEN_PRE_PUSH_HOOK_v1)',
+  };
 }
 
 /** True when the failure looks like "the file/dir we're operating on
@@ -876,10 +912,15 @@ export async function analyzeOne(root, opts = {}) {
   if (!target) return { picked: null };
 
   // Defensive: the target dir may have vanished between when the walk
-  // picked it and when we run. Happens when another tool spawns a
-  // short-lived worktree, kicks the pre-push hook, then deletes the
-  // worktree before our detached background docgen finishes. Skip
-  // cleanly so the next batch step keeps making progress.
+  // picked it and when we run. Two ways this happens in practice:
+  //   1) Worktree cleanup race — another tool spawns a short-lived
+  //      worktree, kicks the pre-push hook, then deletes the worktree
+  //      before our detached background process finishes.
+  //   2) The directory was committed away (refactor moved it) between
+  //      state-load and now in --until-done.
+  // In either case, skip cleanly so the BATCH keeps making progress on
+  // the other dirs. The state entry stays as-is; next run notices and
+  // re-routes.
   if (!existsSync(target)) {
     return {
       picked: relative(root, target) || '.',
@@ -888,7 +929,7 @@ export async function analyzeOne(root, opts = {}) {
     };
   }
 
-  const files = selectFiles(target);
+  const files = selectFiles(target, root);
   const childReadmes = findChildReadmesInState(root, target, state);
   if (files.length === 0 && childReadmes.length === 0) return { picked: null };
 
@@ -957,12 +998,10 @@ export async function analyzeOne(root, opts = {}) {
   const bodyWithoutVersion = cleaned.replace(VERSION_RE, '').replace(/^\s+/, '');
   const finalContent = `${MARKER}\n${normalisedVersionLine}\n\n${bodyWithoutVersion}\n`;
 
-  // Ensure parent exists (mkdirp) and wrap write — if the worktree was
+  // Ensure the parent dir still exists (mkdirp) — if the worktree was
   // partially cleaned mid-flight the leaf dir may be gone even though
-  // the existsSync(target) check above passed. mkdirSync recursive is
-  // a no-op when the dir already exists. ENOENT/ENOTDIR/EACCES at the
-  // write site means the path is gone; skip cleanly instead of
-  // crashing the whole batch.
+  // the existsSync check above passed when we started. mkdirSync with
+  // recursive:true is a no-op when the dir already exists.
   try {
     mkdirSync(dirname(readmePath), { recursive: true });
     writeFileSync(readmePath, finalContent);
@@ -985,10 +1024,13 @@ export async function analyzeOne(root, opts = {}) {
     lastAnalyzed: new Date().toISOString(),
     reason,
     version: finalVersion,
-    files: Object.fromEntries(files.map((f) => [f.name, f.hash])),
+    files: Object.fromEntries(files.map((f) => [f.name, Math.floor(f.mtimeMs)])),
     childVersionsAtAnalysis: Object.fromEntries(
       childReadmes.map((c) => [c.relPath, c.version]),
     ),
+    // Track the curated-context files we read so needsAnalysis can
+    // re-trigger when any of them changes (added, mtime bumped, or
+    // removed entirely).
     curatedContextAtAnalysis: Object.fromEntries(
       curatedContext.map((c) => [c.relPath, Math.floor(c.mtimeMs)]),
     ),
@@ -1053,23 +1095,22 @@ export async function analyzeAllParallel(root, opts = {}) {
     parallel = 1,
     onProgress,
     onBatchStart,
-    scope,                // Set<string> of absolute dir paths, or null
-    changed,              // string[] of relative dir paths (--changed flag); builds scope
+    changed,
+    max,
     ...analyzeOpts
   } = opts;
 
-  // When --changed is provided, build the effective scope set from those
-  // relative dir paths + all their ancestor dirs up to root. This is the
-  // same expansion that --scope uses; --changed is the CLI surface and
-  // this is the internal plumbing.
-  let effectiveScope = scope ?? null;
-  if (changed && changed.length > 0 && !effectiveScope) {
-    effectiveScope = new Set();
+  // Build the "allowed" set when --changed scopes the run. Each changed
+  // relative dir AND all its ancestor dirs up to root are included so
+  // trunk READMEs can still cascade-update.
+  let allowed = null;
+  if (changed && changed.length > 0) {
+    allowed = new Set();
     for (const relDir of changed) {
       let abs = resolve(root, relDir);
       // Walk from the changed dir up to (and including) root.
       while (true) {
-        effectiveScope.add(abs);
+        allowed.add(abs);
         if (abs === root) break;
         const parent = dirname(abs);
         if (parent === abs) break; // filesystem root guard
@@ -1081,12 +1122,34 @@ export async function analyzeAllParallel(root, opts = {}) {
   let done = 0;
   let skipped = 0;
 
+  // Run-size guard: if the actionable count is very large and the caller
+  // didn't scope with --changed or --max, emit one prominent warning.
+  // We compute a preliminary count here (without the livelock set —
+  // that's built below) solely for the warning; the actual iteration
+  // uses the loop below. Only warn on the first pass.
+  if (!max && !changed) {
+    const state0 = loadState(root);
+    let count0 = 0;
+    for (const dir of walkDirs(root)) {
+      if (needsAnalysis(root, dir, state0)) count0++;
+    }
+    if (count0 > 200) {
+      process.stderr.write(
+        `docgen: ${count0} directories to analyze (~${count0} claude calls) — ` +
+        `scope with --changed or cap with --max\n`,
+      );
+    }
+  }
+
   // Livelock guard. The outer loop re-walks the tree each iteration so a
   // freshly-written child README becomes visible to its trunk's staleness
   // check. But a directory whose OWN files keep mutating mid-run — e.g.
-  // a pre-push file whose mtime gets bumped by hook re-installs while
-  // this very sweep runs — stays needsAnalysis-positive forever and is
-  // re-picked on every iteration, so the loop never drains.
+  // tools/secret-scrub/githooks, whose `pre-push` file gets its mtime
+  // bumped by hook re-installs while this very sweep runs — stays
+  // needsAnalysis-positive forever and is re-picked on every iteration,
+  // so the loop never drains. (Observed in the wild: one dir regenerated
+  // 5× with an ever-climbing version, the sweep never terminating, so the
+  // auto-commit it was supposed to produce never happened.)
   //
   // Because we process strictly bottom-up (children before trunks), no
   // directory ever LEGITIMATELY needs analysing twice in a single run. So
@@ -1103,10 +1166,7 @@ export async function analyzeAllParallel(root, opts = {}) {
     const state = loadState(root);
     const actionable = [];
     for (const dir of walkDirs(root)) {
-      // When --scope / --changed is in effect, only consider dirs in that scope.
-      // Scope is pre-expanded to include ancestors, so trunk bubble-up
-      // still fires for parents of the touched leaves.
-      if (effectiveScope && !effectiveScope.has(dir)) continue;
+      if (allowed && !allowed.has(dir)) continue;
       const reason = needsAnalysis(root, dir, state);
       if (!reason) continue;
       if (analyzedThisRun.has(dir)) {
@@ -1138,11 +1198,19 @@ export async function analyzeAllParallel(root, opts = {}) {
     // Process the depth group in chunks of `parallel`. Within a chunk,
     // Promise.allSettled fans out; chunks themselves are serialised so
     // we never have more than `parallel` calls running. allSettled
-    // (vs all) means one slot throwing doesn't discard the OTHER
-    // concurrent results. The 'halt' detection below is the escape
-    // hatch for truly-fatal errors (cwd deleted).
+    // (vs all) is load-bearing: if one analyzeOne throws for one dir
+    // — a network blip on `claude -p`, a vanished worktree, etc. —
+    // the OTHER concurrent dirs in the same chunk should still land
+    // their READMEs instead of being silently discarded.
     for (let i = 0; i < sameDepth.length; i += parallel) {
-      const chunk = sameDepth.slice(i, i + parallel);
+      // When --max is active, never dispatch more dirs than remain in the
+      // budget. Without this cap, a parallel=4 + max=2 run would dispatch
+      // 4 dirs in the first chunk and land 4 "done" instead of stopping at 2.
+      const chunkSize = max !== undefined
+        ? Math.min(parallel, max - done, sameDepth.length - i)
+        : parallel;
+      if (chunkSize <= 0) return { done, skipped };
+      const chunk = sameDepth.slice(i, i + chunkSize);
       // Mark dispatched dirs as done-for-this-run BEFORE awaiting, so even
       // if their files mutate during analysis they are never re-queued.
       for (const b of chunk) analyzedThisRun.add(b.dir);
@@ -1153,20 +1221,29 @@ export async function analyzeAllParallel(root, opts = {}) {
         ),
       );
       let halt = false;
+      let maxReached = false;
       for (let j = 0; j < settled.length; j++) {
         const s = settled[j];
         if (s.status === 'fulfilled') {
           const r = s.value;
           if (r.skipped) skipped++;
-          else if (r.picked) done++;
+          else if (r.picked) {
+            done++;
+            if (max !== undefined && done >= max) maxReached = true;
+          }
           onProgress?.(r);
         } else {
+          // Surface as a skip with the error message so the operator
+          // sees what failed without the whole batch tearing down.
           skipped++;
           onProgress?.({
             picked: chunk[j].dir,
             skipped: 'error',
             message: s.reason?.message ?? String(s.reason),
           });
+          // Detect the "cwd was deleted" fatal — every subsequent
+          // dir would fail the same way (worktree is gone). Bail the
+          // outer loop instead of grinding forever.
           if (s.reason?.halt || s.reason?.code === 'CWD_DELETED') halt = true;
         }
       }
@@ -1178,6 +1255,7 @@ export async function analyzeAllParallel(root, opts = {}) {
         });
         return { done, skipped, halted: true };
       }
+      if (maxReached) return { done, skipped };
     }
   }
 
@@ -1189,11 +1267,23 @@ export async function analyzeAllParallel(root, opts = {}) {
 export function computeStatus(root) {
   const state = loadState(root);
   const dirs = [];
+  let skippedByFilter = 0;
   for (const dir of walkDirs(root)) {
     const rel = relative(root, dir) || '.';
     const entry = state.directories[rel];
     const reason = needsAnalysis(root, dir, state);
     const protectedHandwritten = isHandWrittenReadme(join(dir, 'README.md'));
+    // A dir that needsAnalysis declines (returns null) AND has no state
+    // entry is one docgen will NEVER process — data-only, asset-dump
+    // (>MAX_FILES_PER_DIR), no content, etc. Excluding these from `total`
+    // keeps the report honest on data-heavy repos (otherwise you'd see
+    // "0/12129 documented" because 11.8k of those are skip-on-purpose
+    // research dirs, not real backlog). Count them separately so the
+    // operator can see the filter is doing its job.
+    if (!entry && !reason && !protectedHandwritten) {
+      skippedByFilter += 1;
+      continue;
+    }
     dirs.push({
       dir: rel,
       analyzed: !!entry,
@@ -1214,7 +1304,7 @@ export function computeStatus(root) {
   const uncovered = dirs.filter(
     (d) => !d.analyzed && !d.protected,
   ).length;
-  return { total, documented, stale, uncovered, protected: protectedCount, dirs };
+  return { total, documented, stale, uncovered, protected: protectedCount, skippedByFilter, dirs };
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────
@@ -1231,7 +1321,7 @@ function parseArgs(argv) {
     else if (a === '--model') out.flags.model = argv[++i];
     else if (a === '--timeout-ms') out.flags.timeoutMs = Number(argv[++i]);
     else if (a === '--parallel') out.flags.parallel = Math.max(1, Number(argv[++i]) || 1);
-    else if (a === '--scope') out.flags.scope = argv[++i];
+    else if (a === '--max') out.flags.max = Math.max(1, Number(argv[++i]) || 1);
     else if (a === '--changed') {
       const raw = argv[++i] ?? '';
       out.flags.changed = raw.split(',').map((s) => s.trim()).filter(Boolean);
@@ -1271,6 +1361,9 @@ async function main() {
     console.log(`  stale (needs re-analysis): ${s.stale}`);
     console.log(`  uncovered (never analyzed): ${s.uncovered}`);
     console.log(`  protected (hand-written, skipped): ${s.protected}`);
+    if (s.skippedByFilter > 0) {
+      console.log(`  skipped (data/prose/asset-dump — no code to map): ${s.skippedByFilter}`);
+    }
     const todo = s.dirs
       .filter((d) => !d.protected && (!d.analyzed || d.needsReanalysis))
       .slice(0, 15);
@@ -1287,16 +1380,17 @@ async function main() {
       for (const d of examples) console.log(`    - ${d.dir}/README.md`);
       console.log('  (use --force --dir <path> to deliberately convert a hand-written README)');
     }
-    // Hook-install check. Auto-refresh only fires when the pre-push
-    // hook is installed on this clone. Git hooks aren't versioned,
-    // so every fresh clone starts without one — surface it loudly so
-    // operators notice instead of silently shipping drift.
+    // Hook-install check. Auto-refresh ONLY happens when the pre-push
+    // hook is installed on this clone — git hooks aren't versioned, so
+    // every fresh clone starts without one. Surface it loudly here so
+    // operators notice instead of silently shipping drift on PR
+    // pushes from un-installed clones.
     const hookState = checkPreHookInstalled(root);
     if (!hookState.installed) {
       console.log('');
       console.log('  ⚠ pre-push hook NOT installed on this clone — auto-refresh will not fire');
       console.log(`    reason: ${hookState.reason}`);
-      console.log('    install: ./install-push-hook.sh');
+      console.log('    install: ./tools/docgen/install-push-hook.sh');
     }
     return;
   }
@@ -1311,6 +1405,8 @@ async function main() {
     model: args.flags.model,
     timeoutMs: args.flags.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     dryRun: args.flags.dryRun,
+    changed: args.flags.changed,
+    max: args.flags.max,
   };
 
   if (args.flags.untilDone) {
@@ -1337,40 +1433,11 @@ async function main() {
       return;
     }
     const parallel = args.flags.parallel ?? 1;
-    // --scope <comma-sep-paths>: restrict the walk to (paths + every
-    // ancestor of each path) so a push-driven refresh only re-analyses
-    // dirs containing files that just changed, while still letting
-    // trunk bubble-up reach root through their ancestors.
-    // --changed <comma-sep-relative-dirs>: same semantics as --scope but
-    // takes relative dir paths (not file paths) — used by the pre-push
-    // hook to pass the push diff's changed directories.
-    let scopeSet = null;
-    if (args.flags.scope) {
-      const rawPaths = args.flags.scope
-        .split(',')
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
-      // realpath the root so the ancestor walk's startsWith() check
-      // works under macOS /tmp → /private/tmp symlink.
-      let canonicalRoot;
-      try { canonicalRoot = realpathSync(root); } catch { canonicalRoot = root; }
-      scopeSet = expandScopeWithAncestors(canonicalRoot, rawPaths);
-      console.log(`docgen: --scope restricts walk to ${scopeSet.size} dir(s) (paths + ancestors)`);
-    }
-    // --changed builds a scope from relative dir paths (the hook passes these).
-    // If both --scope and --changed are given, --scope wins.
-    let changedDirs = null;
-    if (args.flags.changed && args.flags.changed.length > 0 && !scopeSet) {
-      changedDirs = args.flags.changed;
-      console.log(`docgen: --changed restricts walk to ${changedDirs.length} dir(s) + ancestors`);
-    }
     let count = 0;
     const t0 = Date.now();
     const { done, skipped } = await analyzeAllParallel(root, {
       ...runOpts,
       parallel,
-      scope: scopeSet,
-      changed: changedDirs,
       onBatchStart: ({ depth, chunkSize }) => {
         console.log(`docgen: → batch at depth ${depth} (${chunkSize} in parallel)`);
       },
