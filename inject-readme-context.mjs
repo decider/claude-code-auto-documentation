@@ -150,6 +150,17 @@ function readmeMeta(text) {
   return { kind: 'hand-written', version: null, reason: null };
 }
 
+/** Pull just the `## Purpose` section body — used for ANCESTOR directories,
+ *  where we want one-line "what is this layer" orientation, not the whole
+ *  Map / file list. Falls back to the post-marker head if there's no
+ *  Purpose heading (e.g. a hand-written README). */
+function extractPurpose(text) {
+  const m = text.match(/^##\s+Purpose\s*\r?\n([\s\S]*?)(?=\r?\n##\s|\s*$)/m);
+  if (m && m[1].trim()) return m[1].trim();
+  const body = text.replace(/^<!--[\s\S]*?-->\s*/g, '').trim();
+  return body.length > 500 ? body.slice(0, 500) + '…' : body;
+}
+
 // ─── dedup IO ─────────────────────────────────────────────────────────────
 
 function loadDedup(sessionId) {
@@ -252,6 +263,12 @@ function main() {
   const dedup = loadDedup(sessionId);
 
   const collected = [];
+  // Tiered injection: the FIRST README found (the file's own dir / nearest
+  // ancestor) gets the FULL map + gotchas — that's the layer you're editing.
+  // Every ancestor above it contributes only its Purpose line, so the chain
+  // stays lean (a deep chain ≈ leaf-full + a few hundred chars per ancestor)
+  // and the relevant detail is never crowded out by distant overviews.
+  let isClosest = true;
   for (const dir of ancestorsUpTo(canonicalStart, canonicalRoot)) {
     const readmePath = join(dir, 'README.md');
     if (!existsSync(readmePath)) continue;
@@ -263,48 +280,93 @@ function main() {
       continue;
     }
     const meta = readmeMeta(text);
-    const trimmed = text.length > MAX_README_BYTES
-      ? text.slice(0, MAX_README_BYTES) + '\n…(truncated)'
-      : text;
+    let content;
+    if (isClosest) {
+      content = text.length > MAX_README_BYTES
+        ? text.slice(0, MAX_README_BYTES) + '\n…(truncated)'
+        : text;
+      isClosest = false;
+    } else {
+      content = extractPurpose(text);
+    }
     collected.push({
       relPath: relative(canonicalRoot, readmePath),
       meta,
-      content: trimmed,
+      content,
     });
     dedup.add(readmePath);
   }
 
   if (collected.length === 0) return;
 
+  const targetRel = relative(canonicalRoot, targetAbs) || targetAbs;
+
   // Best-effort debug trace so we can verify the hook actually fires in
-  // a real Claude Code run (`stream-json` doesn't surface hook stdout
-  // as a separate event). Disabled when DOCGEN_HOOK_TRACE=0.
+  // a real Claude Code run (`stream-json` doesn't surface hook stdout as
+  // a separate event). Logs WHICH READMEs were injected (full ancestor
+  // chain), not just the count, so a verification pass can confirm the
+  // walk reached the top. Disabled when DOCGEN_HOOK_TRACE=0.
   if (process.env.DOCGEN_HOOK_TRACE !== '0') {
     try {
-      const traceLine = `${new Date().toISOString()} session=${sessionId ?? '?'} target=${relative(canonicalRoot, targetAbs) || targetAbs} injected=${collected.length}\n`;
+      const paths = collected.map((c) => c.relPath).join(', ');
+      const traceLine = `${new Date().toISOString()} session=${sessionId ?? '?'} target=${targetRel} injected=${collected.length} [${paths}]\n`;
       writeFileSync('/tmp/docgen-hook-trace.log', traceLine, { flag: 'a' });
     } catch { /* trace is best-effort */ }
   }
 
-  // Print one combined context block. Order: root-most first so the
-  // LLM reads broadest-context to narrowest, matching the pyramid.
+  // Print one combined context block. Order: root-most first so the LLM
+  // reads broadest-context to narrowest, matching the pyramid. Each entry
+  // is labelled with its role relative to the file being touched (repo
+  // root → … → the file's own folder) and its provenance, so the agent
+  // understands WHY each one is here and what it covers.
   collected.reverse();
 
+  const lastIdx = collected.length - 1;
   const lines = [];
   lines.push(
-    `[docgen] Auto-injected ${collected.length} README(s) for ` +
-      `${relative(canonicalRoot, targetAbs) || targetAbs}. ` +
-      `These describe the directory tree above the file you're about to touch — ` +
-      `use them as orientation; you don't need to re-Read them.`,
+    `[docgen:context] You're about to access \`${targetRel}\`. Injected below: the ` +
+      `FULL map for the file's own directory, plus a one-line Purpose for each ` +
+      `ancestor directory up to the repo root — auto-injected (progressive ` +
+      `disclosure) so you have the surrounding architecture without opening each ` +
+      `README. Ordered repo-root → the file's own directory. The map is a ` +
+      `jump-table (concept → file · symbol); grep a symbol to dive in. No need to ` +
+      `re-Read these.`,
   );
   lines.push('');
-  for (const c of collected) {
-    lines.push(`### ${c.relPath} (${c.meta.kind}${c.meta.version ? `, v${c.meta.version}` : ''})`);
+  collected.forEach((c, i) => {
+    const dirRel = c.relPath.replace(/\/?README\.md$/, '') || '.';
+    let role;
+    if (i === lastIdx) role = `the directory containing your target — \`${dirRel}/\``;
+    else if (i === 0) role = dirRel === '.' ? 'repo root (overview)' : `top of chain — \`${dirRel}/\``;
+    else role = `\`${dirRel}/\``;
+    const prov = c.meta.kind === 'generated'
+      ? `docgen-generated v${c.meta.version}${c.meta.reason ? ` — ${c.meta.reason}` : ''}`
+      : 'hand-written';
+    lines.push(`### ${role}`);
+    lines.push(`*${c.relPath} · ${prov}*`);
     lines.push('');
     lines.push(c.content.trim());
     lines.push('');
+  });
+  // CRITICAL: a PreToolUse hook's PLAIN stdout goes to the user's
+  // transcript, NOT to the model. The ONLY way to put text into Claude's
+  // context from PreToolUse is the JSON `hookSpecificOutput.additionalContext`
+  // field. (Emitting plain text here was a silent no-op — the hook fired and
+  // logged but the model never saw the READMEs.) additionalContext is capped
+  // at ~10k chars by Claude Code, so truncate the combined block to fit.
+  const MAX_CONTEXT_CHARS = 10000;
+  let contextText = lines.join('\n');
+  if (contextText.length > MAX_CONTEXT_CHARS) {
+    contextText = contextText.slice(0, MAX_CONTEXT_CHARS) + '\n…(injected context truncated to fit the 10k limit)';
   }
-  process.stdout.write(lines.join('\n') + '\n');
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        additionalContext: contextText,
+      },
+    }),
+  );
 
   saveDedup(sessionId, dedup);
 }
